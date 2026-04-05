@@ -1,1 +1,1 @@
-# ngx-signal
+# ngx-signal v2
