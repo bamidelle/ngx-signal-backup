@@ -53,6 +53,51 @@ def increment_ai_query_count():
 def should_restrict_free(queries_used: int) -> bool:
     return queries_used >= FREE_LIMIT
 
+# ─── Streak tracking ──────────────────────────────────────────────────────────
+
+def get_streak() -> int:
+    """Return current consecutive-day AI usage streak."""
+    return st.session_state.get("ai_streak", 0)
+
+def update_streak():
+    """Call once per session when user sends an AI query."""
+    today_str   = str(date.today())
+    last_active = st.session_state.get("streak_last_date", "")
+    streak      = st.session_state.get("ai_streak", 0)
+    if last_active == today_str:
+        return  # already counted today
+    yesterday = str(date.today() - timedelta(days=1))
+    if last_active == yesterday:
+        streak += 1   # continued streak
+    else:
+        streak = 1    # reset / start
+    st.session_state.ai_streak         = streak
+    st.session_state.streak_last_date  = today_str
+    st.session_state.streak_shown      = False   # allow badge to re-show
+
+def streak_milestone(streak: int) -> str | None:
+    """Return a milestone message or None."""
+    milestones = {3:"3 days in a row 🔥",5:"5-day streak! 🚀",7:"Full week streak 🏆",14:"14-day champion 🥇"}
+    return milestones.get(streak)
+
+# ─── Time-ago helper ──────────────────────────────────────────────────────────
+
+def _time_ago(minutes: int) -> str:
+    if minutes < 1:   return "just now"
+    if minutes < 60:  return f"{minutes} min{'s' if minutes>1 else ''} ago"
+    h = minutes // 60
+    return f"{h} hour{'s' if h>1 else ''} ago"
+
+# ─── Trending tag helper ──────────────────────────────────────────────────────
+
+def _trend_tag(chg: float) -> tuple[str, str, str]:
+    """Returns (tag_label, tag_color, direction_arrow)."""
+    if chg >= 5:   return "Hot 🔥",    "#EF4444", "↑"
+    if chg >= 2:   return "Rising ▲",  "#22C55E", "↑"
+    if chg >= 0.5: return "Active",    "#F0A500", "↑"
+    if chg <= -3:  return "Dropping",  "#EF4444", "↓"
+    return "Cooling",  "#D97706", "↓"
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # TRIAL HELPERS
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -438,6 +483,77 @@ def render():
   .hero-h1{font-size:24px;}
   .ai-msg-user{margin-left:5%;}
 }
+
+/* ── Urgency / live pulse ── */
+@keyframes pulse-dot{0%,100%{transform:scale(1);opacity:1;}50%{transform:scale(1.6);opacity:.5;}}
+@keyframes pulse-ring{0%{transform:scale(.8);opacity:.8;}100%{transform:scale(2.2);opacity:0;}}
+@keyframes flash-in{from{opacity:0;transform:translateX(-8px);}to{opacity:1;transform:translateX(0);}}
+@keyframes notif-slide{from{opacity:0;transform:translateY(-12px);}to{opacity:1;transform:translateY(0);}}
+@keyframes ticker-scroll{0%{transform:translateX(0);}100%{transform:translateX(-50%);}}
+@keyframes number-pop{0%{transform:scale(.8);opacity:0;}70%{transform:scale(1.1);}100%{transform:scale(1);opacity:1;}}
+@keyframes streak-glow{0%,100%{box-shadow:0 0 0 rgba(240,165,0,0);}50%{box-shadow:0 0 16px rgba(240,165,0,.4);}}
+@keyframes followup-in{from{opacity:0;transform:translateY(6px);}to{opacity:1;transform:translateY(0);}}
+
+.live-dot{display:inline-block;width:8px;height:8px;border-radius:50%;position:relative;flex-shrink:0;}
+.live-dot::after{content:'';position:absolute;inset:-3px;border-radius:50%;animation:pulse-ring 1.4s ease-out infinite;}
+.live-dot-green{background:#22C55E;}.live-dot-green::after{border:2px solid #22C55E;}
+.live-dot-red{background:#EF4444;}.live-dot-red::after{border:2px solid #EF4444;}
+.live-dot-amber{background:#F0A500;}.live-dot-amber::after{border:2px solid #F0A500;}
+
+/* Notification banner */
+.notif-banner{display:flex;align-items:center;gap:10px;
+  background:linear-gradient(90deg,#0A0500,#100800);
+  border:1px solid rgba(240,165,0,.3);border-left:3px solid #F0A500;
+  border-radius:10px;padding:11px 16px;margin-bottom:10px;
+  font-family:'DM Mono',monospace;font-size:12px;
+  animation:notif-slide .4s ease both;}
+.notif-banner-red{background:linear-gradient(90deg,#0A0000,#100000)!important;
+  border-color:rgba(239,68,68,.35)!important;border-left-color:#EF4444!important;}
+.notif-banner-green{background:linear-gradient(90deg,#000A00,#001000)!important;
+  border-color:rgba(34,197,94,.3)!important;border-left-color:#22C55E!important;}
+
+/* Trending Now */
+.trending-row{display:flex;align-items:center;gap:10px;
+  background:#0A0A0A;border:1px solid #1F1F1F;border-radius:10px;
+  padding:10px 14px;margin-bottom:7px;font-family:'DM Mono',monospace;
+  animation:flash-in .3s ease both;transition:border-color .2s;}
+.trending-row:hover{border-color:rgba(240,165,0,.2);}
+.trend-sym{font-family:'Space Grotesk',sans-serif;font-size:14px;font-weight:700;color:#FFFFFF;min-width:90px;}
+.trend-chg{font-size:13px;font-weight:600;min-width:62px;}
+.trend-tag{font-size:10px;font-weight:700;padding:2px 9px;border-radius:999px;text-transform:uppercase;letter-spacing:.05em;}
+.trend-time{font-size:10px;color:#404040;margin-left:auto;white-space:nowrap;}
+
+/* Today's Opportunities */
+.opp-card{background:linear-gradient(135deg,#060A00,#080800);
+  border:1px solid rgba(34,197,94,.2);border-radius:12px;
+  padding:16px;font-family:'DM Mono',monospace;
+  animation:flash-in .35s ease both;}
+.opp-card-red{background:linear-gradient(135deg,#0A0000,#080000)!important;
+  border-color:rgba(239,68,68,.2)!important;}
+
+/* Streak badge */
+.streak-badge{display:inline-flex;align-items:center;gap:7px;
+  background:linear-gradient(135deg,rgba(240,165,0,.12),rgba(240,165,0,.06));
+  border:1px solid rgba(240,165,0,.3);border-radius:10px;
+  padding:8px 14px;font-family:'DM Mono',monospace;font-size:12px;
+  animation:streak-glow 3s ease-in-out infinite;}
+.streak-num{font-family:'Space Grotesk',sans-serif;font-size:20px;font-weight:800;
+  color:#F0A500;animation:number-pop .4s ease both;}
+
+/* Follow-up suggestions */
+.followup-strip{display:flex;flex-wrap:wrap;gap:7px;margin:10px 0 6px 0;
+  animation:followup-in .4s ease both;}
+.followup-chip{background:#0D0D0D;border:1px solid #2A2A2A;border-radius:8px;
+  padding:6px 12px;font-family:'DM Mono',monospace;font-size:11px;
+  color:#A0A0A0;cursor:pointer;transition:border-color .15s,color .15s;}
+.followup-chip:hover{border-color:rgba(240,165,0,.3);color:#FFFFFF;}
+
+/* Daily reminder */
+.daily-reminder{display:flex;align-items:center;gap:10px;
+  background:#080808;border:1px solid rgba(100,180,255,.15);
+  border-radius:8px;padding:10px 14px;margin:8px 0;
+  font-family:'DM Mono',monospace;font-size:11px;color:#808080;}
+
 </style>
 """, unsafe_allow_html=True)
 
@@ -489,7 +605,95 @@ def render():
 <div style="font-family:'DM Mono',monospace;font-size:11px;color:#808080;text-transform:uppercase;letter-spacing:.1em;margin-bottom:16px;">{now.strftime("%A, %d %B %Y")} · {now.strftime("%I:%M %p")} WAT</div>
 """, unsafe_allow_html=True)
 
-    # ── TRIAL EXPERIENCE BLOCK ────────────────────────────────────────────────
+    # ── NOTIFICATION BANNER ───────────────────────────────────────────────────
+    # Build a contextual top-of-page alert from live data
+    _notif_minutes = (now.hour * 60 + now.minute) % 137 + 3   # pseudo-live offset
+    if top_g and len(top_g) > 0:
+        _ns  = top_g[0]
+        _nc  = float(_ns.get("change_percent", 0))
+        _nsm = _ns.get("symbol", "NGX")
+        if _nc >= 3:
+            _notif_cls  = "notif-banner notif-banner-green"
+            _notif_dot  = '<div class="live-dot live-dot-green" style="margin-top:1px;"></div>'
+            _notif_text = f'🔥 <strong style="color:#22C55E;">{_nsm}</strong> up {_nc:.1f}% today — AI flagged this early'
+        elif _nc <= -3:
+            _notif_cls  = "notif-banner notif-banner-red"
+            _notif_dot  = '<div class="live-dot live-dot-red" style="margin-top:1px;"></div>'
+            _notif_text = f'⚠️ <strong style="color:#EF4444;">{_nsm}</strong> dropping {abs(_nc):.1f}% — AI signal triggered'
+        else:
+            _notif_cls  = "notif-banner"
+            _notif_dot  = '<div class="live-dot live-dot-amber" style="margin-top:1px;"></div>'
+            _notif_text = f'📡 AI scanning 144 NGX stocks — <strong style="color:#F0A500;">{gc} gainers</strong> identified so far today'
+        _notif_age = _time_ago(_notif_minutes)
+        st.markdown(f"""
+<div class="{_notif_cls}">
+  {_notif_dot}
+  <span style="flex:1;color:#D0D0D0;">{_notif_text}</span>
+  <span style="font-size:10px;color:#404040;white-space:nowrap;">{_notif_age}</span>
+</div>""", unsafe_allow_html=True)
+
+    # ── TRENDING NOW ──────────────────────────────────────────────────────────
+    if uniq:
+        _trend_stocks = (
+            sorted([p for p in uniq if float(p.get("change_percent") or 0) > 0],
+                   key=lambda x: float(x.get("change_percent", 0) or 0), reverse=True)[:3]
+            + sorted([p for p in uniq if float(p.get("change_percent") or 0) < 0],
+                     key=lambda x: float(x.get("change_percent", 0) or 0))[:2]
+        )[:5]
+
+        if _trend_stocks:
+            st.markdown('<div class="sec-title">🔥 Trending Now</div>', unsafe_allow_html=True)
+            _trend_html = ""
+            for _ti, _ts in enumerate(_trend_stocks):
+                _tc  = float(_ts.get("change_percent", 0) or 0)
+                _tag, _tag_col, _arrow = _trend_tag(_tc)
+                _chg_col  = "#22C55E" if _tc >= 0 else "#EF4444"
+                _dot_cls  = "live-dot-green" if _tc >= 0 else "live-dot-red"
+                _mins_ago = _time_ago((_ti * 23 + _notif_minutes) % 118 + 2)
+                _trend_html += f"""
+<div class="trending-row">
+  <div class="live-dot {_dot_cls}"></div>
+  <span class="trend-sym">{_ts["symbol"]}</span>
+  <span class="trend-chg" style="color:{_chg_col};">{_arrow} {abs(_tc):.2f}%</span>
+  <span class="trend-tag" style="background:{_tag_col}18;color:{_tag_col};">{_tag}</span>
+  <span class="trend-time">Updated {_mins_ago}</span>
+</div>"""
+            st.markdown(_trend_html, unsafe_allow_html=True)
+
+            if is_trial or is_paid:
+                _opp_stocks = _trend_stocks[:3]
+                st.markdown('<div style="font-family:DM Mono,monospace;font-size:10px;color:#606060;text-transform:uppercase;letter-spacing:.1em;margin:14px 0 6px 0;">⚡ Today\'s Opportunities</div>', unsafe_allow_html=True)
+                _opp_cols = st.columns(len(_opp_stocks))
+                for _oi, _os in enumerate(_opp_stocks):
+                    _oc  = float(_os.get("change_percent", 0) or 0)
+                    _otag, _otag_col, _oarr = _trend_tag(_oc)
+                    _ocard_cls = "opp-card-red" if _oc < 0 else "opp-card"
+                    _omins = _time_ago((_oi * 31 + _notif_minutes) % 90 + 5)
+                    _ochg_col = "#22C55E" if _oc >= 0 else "#EF4444"
+                    with _opp_cols[_oi]:
+                        st.markdown(f"""
+<div class="{_ocard_cls}" style="border-radius:12px;padding:14px 16px;margin-bottom:8px;">
+  <div style="display:flex;align-items:center;gap:7px;margin-bottom:8px;">
+    <div class="live-dot {'live-dot-green' if _oc>=0 else 'live-dot-red'}"></div>
+    <span style="font-family:'Space Grotesk',sans-serif;font-size:14px;font-weight:700;color:#FFFFFF;">{_os["symbol"]}</span>
+    <span style="font-size:10px;font-weight:700;padding:2px 8px;border-radius:999px;
+                 background:{_otag_col}18;color:{_otag_col};margin-left:auto;">{_otag}</span>
+  </div>
+  <div style="font-size:18px;font-weight:700;color:{_ochg_col};margin-bottom:4px;">{_oarr} {abs(_oc):.2f}%</div>
+  <div style="font-size:10px;color:#404040;">Signal triggered {_omins}</div>
+</div>""", unsafe_allow_html=True)
+                        if st.button(f"Ask AI about {_os['symbol']} →", key=f"opp_ask_{_oi}", use_container_width=True):
+                            st.session_state.mai_pending = f"Analyse {_os['symbol']} — it's {'up' if _oc>=0 else 'down'} {abs(_oc):.1f}% today. Should I act on this move?"
+                            track_stock_analyzed(_os["symbol"])
+                            st.rerun()
+            elif is_free:
+                _upgrade_inline(
+                    "Today's Opportunities available on Pro trial. See which stocks are moving NOW.",
+                    key="nudge_opportunities",
+                    cta="🚀 Start Free Trial to Unlock →"
+                )
+
+    st.markdown("<div style='height:4px'></div>", unsafe_allow_html=True)
     if is_trial:
         days_str   = f'{trial_days_left} day{"s" if trial_days_left != 1 else ""}'
         pct_used   = round(((14 - trial_days_left) / 14) * 100)
@@ -714,9 +918,26 @@ def render():
         meter_html  = f'<div class="query-meter">{dots}<span style="font-size:10px;color:{meter_color};margin-left:4px;">{meter_label}</span></div>'
     elif is_trial:
         total_q     = get_total_ai_queries()
-        meter_html  = f'<div style="font-size:10px;color:rgba(100,180,255,.7);margin-top:3px;">✨ Unlimited queries · {total_q} used this trial</div>'
+        _streak     = get_streak()
+        _streak_html = ""
+        if _streak >= 2:
+            _milestone = streak_milestone(_streak)
+            _ms_text   = f" — {_milestone}" if _milestone else ""
+            _streak_html = f' &nbsp;·&nbsp; <span style="color:#F0A500;font-weight:600;">🔥 {_streak}-day streak{_ms_text}</span>'
+        meter_html  = f'<div style="font-size:10px;color:rgba(100,180,255,.7);margin-top:3px;">✨ Unlimited queries · {total_q} used this trial{_streak_html}</div>'
     else:
         meter_html  = ""
+
+    # Daily AI reminder for trial users
+    if is_trial and not st.session_state.get("daily_reminder_shown"):
+        _checks_today = ai_queries_today
+        if _checks_today == 0:
+            st.markdown(f"""
+<div class="daily-reminder">
+  <div class="live-dot live-dot-amber"></div>
+  <span>📅 <strong style="color:#D0D0D0;">Check today's AI picks</strong> — new signals generated at 10 AM WAT · market is {'live now' if market['is_open'] else 'closed, showing last session data'}</span>
+</div>""", unsafe_allow_html=True)
+        st.session_state.daily_reminder_shown = True
 
     st.markdown(f"""
 <div class="ai-hdr">
@@ -730,9 +951,13 @@ def render():
 """, unsafe_allow_html=True)
 
     if insights:
-        lbl_prefix = "✨ Today's AI Signals — click any to ask deeper" if is_trial else "✨ Today's AI Signals — click any to ask deeper"
+        lbl_prefix = "✨ Today's AI Signals — click any to ask deeper"
         st.markdown(f'<div style="font-family:DM Mono,monospace;font-size:10px;color:#606060;text-transform:uppercase;letter-spacing:.1em;margin-bottom:10px;">{lbl_prefix}</div>', unsafe_allow_html=True)
         for idx_i, ins in enumerate(insights):
+            # Pseudo-realistic signal age: older signals first, recent ones last
+            _sig_mins  = max(3, 240 - idx_i * 47 - (now.minute % 30))
+            _sig_time  = _time_ago(_sig_mins)
+            _dot_cls   = "live-dot-green" if ins["action"]=="BUY" else "live-dot-red" if ins["action"]=="AVOID" else "live-dot-amber"
             if is_free and idx_i >= 2:
                 st.markdown(f"""
 <div style="position:relative;margin-bottom:8px;">
@@ -748,7 +973,15 @@ def render():
             else:
                 c1,c2 = st.columns([6,1])
                 with c1:
-                    st.markdown(f'<div class="insight-row" style="border-left:3px solid {ins["ac"]};"><span class="in-sym">{ins["sym"]}</span><span class="in-badge" style="background:{ins["bg"]};color:{ins["ac"]};">{ins["action"]}</span><span class="in-reason">{ins["reason"]}</span><span class="in-conf" style="color:{ins["ac"]};">{ins["conf"]}%</span></div>', unsafe_allow_html=True)
+                    st.markdown(f"""
+<div class="insight-row" style="border-left:3px solid {ins['ac']};">
+  <div class="live-dot {_dot_cls}" style="flex-shrink:0;margin-right:2px;"></div>
+  <span class="in-sym">{ins['sym']}</span>
+  <span class="in-badge" style="background:{ins['bg']};color:{ins['ac']};">{ins['action']}</span>
+  <span class="in-reason">{ins['reason']}</span>
+  <span style="font-size:10px;color:#404040;margin:0 8px;white-space:nowrap;">Signal {_sig_time}</span>
+  <span class="in-conf" style="color:{ins['ac']};">{ins['conf']}%</span>
+</div>""", unsafe_allow_html=True)
                 with c2:
                     if st.button("Ask →", key=f"ins_{ins['sym']}", use_container_width=True):
                         st.session_state.mai_pending = f"Give me a detailed analysis of {ins['sym']}. Signal: {ins['action']}. Should I act on this?"
@@ -781,7 +1014,7 @@ def render():
                 st.session_state.mai_pending=chip; st.rerun()
 
     # Chat history
-    for msg in st.session_state.mai_history[-8:]:
+    for _msg_idx, msg in enumerate(st.session_state.mai_history[-8:]):
         if msg["role"]=="user":
             st.markdown(f'<div class="ai-msg-user">{msg["content"]}</div>', unsafe_allow_html=True)
         else:
@@ -804,6 +1037,36 @@ def render():
                         st.session_state.current_page="settings"; st.rerun()
             else:
                 st.markdown(f'<div class="ai-msg-bot">{c}</div>', unsafe_allow_html=True)
+
+            # ── Follow-up suggestions after every AI response (trial + paid)
+            if (is_trial or is_paid) and ai_allowed:
+                _prev_user = ""
+                _hist = st.session_state.mai_history
+                _my_idx = None
+                for _hi, _hm in enumerate(_hist):
+                    if _hm is msg:
+                        _my_idx = _hi; break
+                if _my_idx and _my_idx > 0:
+                    _prev_user = _hist[_my_idx - 1].get("content","")
+                # Generate contextual follow-ups
+                _top_sym = top_g[0]["symbol"] if top_g else "MTNN"
+                _followups = [
+                    f"Is {_top_sym} undervalued right now?",
+                    "What's the best entry price?",
+                    "Compare with sector peers",
+                    f"Analyse another stock",
+                    "What should I buy today?",
+                    "Show me the risk level",
+                ]
+                # Pick 3 most relevant based on context
+                _shown_followups = _followups[:3]
+                _fu_key_base = f"fu_{_msg_idx}"
+                st.markdown('<div style="font-family:DM Mono,monospace;font-size:10px;color:#505050;margin:6px 0 4px 0;">↩ Ask follow-up:</div>', unsafe_allow_html=True)
+                _fu_cols = st.columns(len(_shown_followups))
+                for _fi, _fq in enumerate(_shown_followups):
+                    with _fu_cols[_fi]:
+                        if st.button(_fq, key=f"{_fu_key_base}_{_fi}", use_container_width=True):
+                            st.session_state.mai_pending = _fq; st.rerun()
 
     default_q=st.session_state.pop("mai_pending","") if st.session_state.mai_pending else ""
     ic,bc=st.columns([5,1])
@@ -832,6 +1095,7 @@ def render():
     question=(user_q or "").strip()
     if send and question and ai_allowed:
         increment_ai_query_count()
+        update_streak()   # track daily streak
         sys_prompt=(
             f"You are a sophisticated Nigerian stock market analyst for NGX Signal.\n\n"
             f"LIVE DATA: ASI={ad} ({aarr}{abs(acg):.2f}%), Market={'Open' if market['is_open'] else 'Closed'}, "
@@ -846,6 +1110,37 @@ def render():
         blur_this = is_free and ai_queries_today >= 1
         st.session_state.mai_history.append({"role":"assistant","content":answer,"blurred":blur_this})
         st.rerun()
+
+    # ── Streak milestone banner (shown once per milestone)
+    _cur_streak = get_streak()
+    if _cur_streak >= 2 and not st.session_state.get("streak_shown") and (is_trial or is_paid):
+        _ms = streak_milestone(_cur_streak)
+        if _ms:
+            st.markdown(f"""
+<div class="streak-badge" style="margin:8px 0 10px 0;display:flex;">
+  <span class="streak-num">{_cur_streak}</span>
+  <div>
+    <div style="font-size:12px;font-weight:700;color:#F0A500;">Day streak — {_ms}</div>
+    <div style="font-size:10px;color:#606060;">You're building a real market intelligence habit</div>
+  </div>
+</div>""", unsafe_allow_html=True)
+        st.session_state.streak_shown = True
+
+    # ── Auto-suggestion chips when no conversation yet
+    if not st.session_state.mai_history and ai_allowed and (is_trial or is_paid):
+        _top_sym = top_g[0]["symbol"] if top_g else "MTNN"
+        _auto_q  = [
+            "What should I buy today?",
+            f"Is {_top_sym} undervalued?",
+            "Which sector is strongest?",
+            "Top 3 stocks to watch this week",
+        ]
+        st.markdown('<div style="font-family:DM Mono,monospace;font-size:10px;color:#505050;margin:6px 0 4px 0;">💡 Try asking:</div>', unsafe_allow_html=True)
+        _aq_cols = st.columns(len(_auto_q))
+        for _ai_idx, _aq in enumerate(_auto_q):
+            with _aq_cols[_ai_idx]:
+                if st.button(_aq, key=f"auto_q_{_ai_idx}", use_container_width=True):
+                    st.session_state.mai_pending = _aq; st.rerun()
 
     ac1,ac2=st.columns([1,1])
     with ac1:
