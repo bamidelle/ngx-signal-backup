@@ -625,21 +625,23 @@ def _render_downgrade_modal(name: str, stats: dict):
 # PERSONALIZED GREETING STRIP
 # ══════════════════════════════════════════════════════════════════════════════
 
-def render_personalized_strip(tier: str, profile: dict, sb, name: str, uniq: list) -> None:
+def render_personalized_strip(tier: str, profile: dict, name: str, uniq: list) -> None:
     """
-    Slim one-line personalized context bar rendered just below the greeting block.
-    Visible to: free, trial, starter, trader, pro.
-    Invisible to: visitor.
+    Slim one-line personalized context bar rendered immediately after the
+    greeting block. Invisible to visitors. Each tier sees different content.
     """
     if tier == "visitor":
         return
 
-    # ── Shared helpers ────────────────────────────────────────────────────────
-    last_ticker  = (st.session_state.get("last_ticker_asked") or "").strip().upper()
-    ticker_data  = next((p for p in uniq if (p.get("symbol") or "").upper() == last_ticker), None) if last_ticker else None
-    chg          = float(ticker_data.get("change_percent", 0)) if ticker_data else None
-    chg_str      = (f"+{chg:.2f}% ▲" if chg >= 0 else f"{chg:.2f}% ▼") if chg is not None else None
-    chg_color    = ("#22C55E" if chg >= 0 else "#EF4444") if chg is not None else "#F0A500"
+    # ── Shared data ───────────────────────────────────────────────────────────
+    last_ticker = (st.session_state.get("last_ticker_asked") or "").strip().upper()
+    ticker_data = next(
+        (p for p in uniq if (p.get("symbol") or "").upper() == last_ticker),
+        None
+    ) if last_ticker else None
+    chg       = float(ticker_data.get("change_percent", 0)) if ticker_data else None
+    chg_str   = (f"+{chg:.2f}% ▲" if chg >= 0 else f"{chg:.2f}% ▼") if chg is not None else None
+    chg_color = ("#22C55E" if chg >= 0 else "#EF4444") if chg is not None else "#F0A500"
 
     last_date    = st.session_state.get("last_query_date")
     if last_date and not isinstance(last_date, date):
@@ -648,62 +650,63 @@ def render_personalized_strip(tier: str, profile: dict, sb, name: str, uniq: lis
     days_ago     = (date.today() - last_date).days if last_date else None
     days_ago_str = (f"{days_ago} day{'s' if days_ago != 1 else ''} ago") if days_ago is not None else "recently"
 
-    used_today   = get_ai_query_count()
-    streak       = get_streak()
-    streak_html  = (f'🔥 <span style="color:#F0A500;font-weight:700;">{streak}-day streak</span>'
-                    if streak >= 2 else "—")
+    used_today  = get_ai_query_count()
+    streak      = get_streak()
+    streak_html = (f'🔥 <span style="color:#F0A500;font-weight:700;">{streak}-day streak</span>'
+                   if streak >= 2 else '<span style="color:#404040;">no streak yet</span>')
 
-    # ── Strip CSS (injected once per render) ──────────────────────────────────
+    # ── Strip CSS ─────────────────────────────────────────────────────────────
     st.markdown("""
 <style>
 .ps-strip{
-  display:flex;align-items:center;justify-content:space-between;
+  display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:6px;
   background:#080808;border:1px solid #1F1F1F;border-left:3px solid #F0A500;
-  border-radius:10px;padding:11px 16px;margin-bottom:12px;
+  border-radius:10px;padding:10px 16px;margin-bottom:12px;
   font-family:'DM Mono',monospace;font-size:12px;color:#C0C0C0;
   animation:notif-slide .35s ease both;
 }
 .ps-gold{color:#F0A500;font-weight:700;}
 .ps-white{color:#FFFFFF;font-weight:600;}
-.ps-dim{color:#606060;font-size:10px;}
-.ps-right{font-size:10px;color:#404040;white-space:nowrap;margin-left:12px;}
+.ps-dim{color:#606060;}
+.ps-right{font-size:10px;color:#404040;white-space:nowrap;}
 </style>""", unsafe_allow_html=True)
+
+    show_upgrade_btn = False
+    upgrade_key      = f"ps_upgrade_{tier}"
 
     # ── FREE ──────────────────────────────────────────────────────────────────
     if tier == "free":
         limit = get_usage_limit("ai_queries", "free") or 2
         if used_today == 0:
             msg = (f'👋 Welcome back, <span class="ps-gold">{name}</span>. '
-                   f'You have <span class="ps-white">{limit} free AI queries</span> today — '
-                   f'ask your first question below.')
+                   f'You have <span class="ps-white">{limit} free AI queries</span> '
+                   f'today — ask your first question below.')
             right = ""
         else:
             rem = max(0, limit - used_today)
-            msg = (f'⚡ You\'ve used <span class="ps-white">{used_today}</span> of '
+            msg = (f'⚡ <span class="ps-gold">{name}</span> — used '
+                   f'<span class="ps-white">{used_today}</span> of '
                    f'<span class="ps-white">{limit}</span> free queries today. '
                    f'Upgrade for unlimited AI access.')
             right = '<span class="ps-right">Upgrade ↗</span>'
-
+            show_upgrade_btn = (rem == 0)
         st.markdown(f'<div class="ps-strip"><span>{msg}</span>{right}</div>',
                     unsafe_allow_html=True)
-        if used_today >= limit:
-            # nudge button placed off-screen visually but still functional
-            if st.button("Upgrade ↗", key="ps_free_upgrade", type="primary"):
-                st.session_state.current_page = "settings"; st.rerun()
 
     # ── TRIAL ─────────────────────────────────────────────────────────────────
     elif tier == "trial":
         trial_day_num = get_trial_day_number(profile)
-        total_q = get_total_ai_queries()
+        total_q       = get_total_ai_queries()
         if last_ticker and ticker_data and chg is not None:
             msg = (f'📡 <span class="ps-gold">{name}</span>, '
                    f'<span class="ps-white">{last_ticker}</span> is '
-                   f'<span style="color:{chg_color};font-weight:700;">{chg_str}</span> today '
-                   f'— you asked about it <span class="ps-white">{days_ago_str}</span>.')
+                   f'<span style="color:{chg_color};font-weight:700;">{chg_str}</span> '
+                   f'today — you asked about it '
+                   f'<span class="ps-white">{days_ago_str}</span>.')
         else:
             msg = (f'✨ Trial Day <span class="ps-white">{trial_day_num}</span> of 14 — '
                    f'<span class="ps-white">{total_q}</span> AI queries used. '
-                   f'Your edge is live. Ask anything below.')
+                   f'Your full market edge is live. Ask anything below.')
         st.markdown(f'<div class="ps-strip"><span>{msg}</span></div>',
                     unsafe_allow_html=True)
 
@@ -712,55 +715,56 @@ def render_personalized_strip(tier: str, profile: dict, sb, name: str, uniq: lis
         limit = 15
         rem   = max(0, limit - used_today)
         if last_ticker and ticker_data and chg is not None:
-            msg = (f'📊 <span class="ps-gold">{last_ticker}</span> update: '
-                   f'<span style="color:{chg_color};font-weight:700;">{chg_str}</span> today '
-                   f'&nbsp;·&nbsp; <span class="ps-white">{rem}/{limit}</span> queries left '
-                   f'&nbsp;·&nbsp; Streak: {streak_html}')
+            msg = (f'📊 <span class="ps-gold">{last_ticker}</span>: '
+                   f'<span style="color:{chg_color};font-weight:700;">{chg_str}</span> today'
+                   f' &nbsp;·&nbsp; <span class="ps-white">{rem}/{limit}</span> queries left'
+                   f' &nbsp;·&nbsp; Streak: {streak_html}')
         else:
-            msg = (f'📊 <span class="ps-gold">{name}</span> '
-                   f'&nbsp;·&nbsp; <span class="ps-white">{rem}/{limit}</span> queries used today '
-                   f'&nbsp;·&nbsp; Streak: {streak_html}')
+            msg = (f'📊 <span class="ps-gold">{name}</span>'
+                   f' &nbsp;·&nbsp; <span class="ps-white">{rem}/{limit}</span> queries left today'
+                   f' &nbsp;·&nbsp; Streak: {streak_html}')
         right = '<span class="ps-right">Upgrade ↗</span>' if rem == 0 else ""
+        show_upgrade_btn = (rem == 0)
         st.markdown(f'<div class="ps-strip"><span>{msg}</span>{right}</div>',
                     unsafe_allow_html=True)
-        if rem == 0:
-            if st.button("Upgrade ↗", key="ps_starter_upgrade", type="primary"):
-                st.session_state.current_page = "settings"; st.rerun()
 
     # ── TRADER ────────────────────────────────────────────────────────────────
     elif tier == "trader":
         if last_ticker and ticker_data and chg is not None:
             msg = (f'📡 <span class="ps-gold">{last_ticker}</span> is '
-                   f'<span style="color:{chg_color};font-weight:700;">{chg_str}</span> today '
-                   f'&nbsp;·&nbsp; Unlimited queries '
-                   f'&nbsp;·&nbsp; Streak: {streak_html} '
-                   f'&nbsp;·&nbsp; <span class="ps-dim">🇳🇬 Pidgin mode available</span>')
+                   f'<span style="color:{chg_color};font-weight:700;">{chg_str}</span> today'
+                   f' &nbsp;·&nbsp; Unlimited queries'
+                   f' &nbsp;·&nbsp; Streak: {streak_html}'
+                   f' &nbsp;·&nbsp; <span class="ps-dim">🇳🇬 Pidgin mode available</span>')
         else:
-            msg = (f'✨ <span class="ps-gold">{name}</span> '
-                   f'&nbsp;·&nbsp; Unlimited queries '
-                   f'&nbsp;·&nbsp; Streak: {streak_html} '
-                   f'&nbsp;·&nbsp; Full NGX intelligence unlocked')
+            msg = (f'✨ <span class="ps-gold">{name}</span>'
+                   f' &nbsp;·&nbsp; Unlimited queries'
+                   f' &nbsp;·&nbsp; Streak: {streak_html}'
+                   f' &nbsp;·&nbsp; Full NGX intelligence unlocked')
         st.markdown(f'<div class="ps-strip"><span>{msg}</span></div>',
                     unsafe_allow_html=True)
 
     # ── PRO ───────────────────────────────────────────────────────────────────
     elif tier == "pro":
         if last_ticker and ticker_data and chg is not None:
-            msg = (f'🏆 <span class="ps-gold">PRO</span> '
-                   f'&nbsp;·&nbsp; <span class="ps-white">{last_ticker}</span>: '
-                   f'<span style="color:{chg_color};font-weight:700;">{chg_str}</span> today '
-                   f'&nbsp;·&nbsp; Unlimited AI '
-                   f'&nbsp;·&nbsp; PDF exports ready '
-                   f'&nbsp;·&nbsp; Advanced outputs on')
+            msg = (f'🏆 <span class="ps-gold">PRO</span>'
+                   f' &nbsp;·&nbsp; <span class="ps-white">{last_ticker}</span>: '
+                   f'<span style="color:{chg_color};font-weight:700;">{chg_str}</span> today'
+                   f' &nbsp;·&nbsp; Unlimited AI'
+                   f' &nbsp;·&nbsp; PDF exports ready'
+                   f' &nbsp;·&nbsp; Advanced outputs on')
         else:
-            msg = (f'🏆 <span class="ps-gold">PRO</span> '
-                   f'&nbsp;·&nbsp; <span class="ps-white">{name}</span> '
-                   f'&nbsp;·&nbsp; Unlimited AI '
-                   f'&nbsp;·&nbsp; PDF exports '
-                   f'&nbsp;·&nbsp; Advanced outputs '
-                   f'&nbsp;·&nbsp; Full intelligence active')
+            msg = (f'🏆 <span class="ps-gold">PRO</span>'
+                   f' &nbsp;·&nbsp; <span class="ps-white">{name}</span>'
+                   f' &nbsp;·&nbsp; Unlimited AI &nbsp;·&nbsp; PDF exports'
+                   f' &nbsp;·&nbsp; Advanced outputs &nbsp;·&nbsp; Full intelligence active')
         st.markdown(f'<div class="ps-strip"><span>{msg}</span></div>',
                     unsafe_allow_html=True)
+
+    # ── Upgrade nudge button (hidden label, only for free/starter at limit) ──
+    if show_upgrade_btn:
+        if st.button("Upgrade now →", key=upgrade_key, type="primary"):
+            st.session_state.current_page = "settings"; st.rerun()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -811,17 +815,28 @@ def render():
     st.markdown("""
 <style>
 @import url('https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=Space+Grotesk:wght@500;600;700;800&display=swap');
-.sec-title{font-family:'Space Grotesk',sans-serif;font-size:18px;font-weight:700;color:#FFFFFF;margin:24px 0 8px 0;}
-.sec-intro{font-family:'DM Mono',monospace;font-size:13px;color:#B0B0B0;line-height:1.7;margin-bottom:14px;background:#0A0A0A;border:1px solid #1F1F1F;border-radius:8px;padding:14px 16px;}
-.ni{background:#0A0A0A;border:1px solid #1F1F1F;border-radius:8px;padding:12px 16px;margin-bottom:8px;font-family:'DM Mono',monospace;}
-.mg{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-bottom:16px;}
-.mc{background:#0A0A0A;border:1px solid #1F1F1F;border-radius:12px;padding:16px;font-family:'DM Mono',monospace;transition:border-color .25s;}
+.sec-title{font-family:'Space Grotesk',sans-serif;font-size:18px;font-weight:700;color:#FFFFFF;margin:18px 0 6px 0;}
+.sec-intro{font-family:'DM Mono',monospace;font-size:13px;color:#B0B0B0;line-height:1.7;margin-bottom:12px;background:#0A0A0A;border:1px solid #1F1F1F;border-radius:8px;padding:12px 16px;}
+.ni{background:#0A0A0A;border:1px solid #1F1F1F;border-radius:8px;padding:12px 16px;margin-bottom:6px;font-family:'DM Mono',monospace;}
+.mg{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-bottom:14px;}
+.mc{background:#0A0A0A;border:1px solid #1F1F1F;border-radius:12px;padding:14px;font-family:'DM Mono',monospace;transition:border-color .25s;}
 .mc:hover{border-color:rgba(240,165,0,.3);}
 .ml{font-size:10px;color:#808080;text-transform:uppercase;letter-spacing:.1em;margin-bottom:8px;}
 .mv{font-size:22px;font-weight:500;line-height:1;margin-bottom:4px;}
 .ms{font-size:11px;color:#808080;}
-.sp-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin:12px 0 16px 0;}
-.sp-card{background:#0A0A0A;border:1px solid #1F1F1F;border-radius:10px;padding:16px;font-family:'DM Mono',monospace;}
+.sp-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin:10px 0 14px 0;}
+.sp-card{background:#0A0A0A;border:1px solid #1F1F1F;border-radius:10px;padding:14px;font-family:'DM Mono',monospace;}
+/* Guide steps */
+.guide-step{display:flex;align-items:flex-start;gap:14px;background:#0A0A0A;border:1px solid #1F1F1F;border-radius:10px;padding:14px 16px;margin-bottom:8px;}
+.guide-num{width:28px;height:28px;border-radius:50%;background:linear-gradient(135deg,#F0A500,#D97706);color:#000;font-family:'Space Grotesk',sans-serif;font-size:13px;font-weight:800;display:flex;align-items:center;justify-content:center;flex-shrink:0;}
+.guide-body{font-family:'DM Mono',monospace;}
+.guide-title{font-size:13px;font-weight:700;color:#FFFFFF;margin-bottom:3px;}
+.guide-text{font-size:11px;color:#808080;line-height:1.6;}
+/* FAQ accordion */
+.faq-item{border:1px solid #1F1F1F;border-radius:10px;margin-bottom:6px;overflow:hidden;}
+.faq-q{font-family:'DM Mono',monospace;font-size:13px;font-weight:600;color:#FFFFFF;padding:13px 16px;cursor:pointer;display:flex;justify-content:space-between;align-items:center;background:#0A0A0A;}
+.faq-q:hover{background:#111;}
+.faq-a{font-family:'DM Mono',monospace;font-size:12px;color:#A0A0A0;line-height:1.7;padding:0 16px 13px 16px;background:#080808;}
 @keyframes badge-pulse{0%,100%{box-shadow:0 0 0 rgba(240,165,0,0);}50%{box-shadow:0 0 14px rgba(240,165,0,.35);}}
 @keyframes hero-fadein{from{opacity:0;transform:translateY(10px);}to{opacity:1;transform:translateY(0);}}
 @keyframes ai-glow{0%,100%{box-shadow:0 0 0 rgba(100,180,255,0);border-color:#1F1F1F;}50%{box-shadow:0 0 28px rgba(100,180,255,.12);border-color:rgba(100,180,255,.3);}}
@@ -935,7 +950,15 @@ def render():
     if tier in ("visitor","free"):
         st.markdown("""
 <div class="sticky-upgrade">
-  <button onclick="window.location.reload()">🚀 Start Free Trial — No Card Needed</button>
+  <button id="sticky-trial-btn" onclick="
+    var btns = window.parent.document.querySelectorAll('button');
+    for(var i=0;i<btns.length;i++){
+      if(btns[i].innerText && btns[i].innerText.includes('Sign up free')){btns[i].click();return;}
+      if(btns[i].innerText && btns[i].innerText.includes('Create Free Account')){btns[i].click();return;}
+      if(btns[i].innerText && btns[i].innerText.includes('Start Free')){btns[i].click();return;}
+    }
+    window.parent.document.getElementById('home_upgrade') && window.parent.document.getElementById('home_upgrade').click();
+  ">🚀 Start Free Trial — No Card Needed</button>
   <div class="sticky-sub">14 days free · Unlimited AI · Cancel anytime</div>
 </div>""", unsafe_allow_html=True)
 
@@ -980,7 +1003,7 @@ def render():
 </div>""", unsafe_allow_html=True)
 
     # ── PERSONALIZED GREETING STRIP ──────────────────────────────────────────
-    render_personalized_strip(tier, profile, sb, name, uniq)
+    render_personalized_strip(tier, profile, name, uniq)
 
     # ── NOTIFICATION BANNER ───────────────────────────────────────────────────
     _notif_minutes = (now.hour * 60 + now.minute) % 137 + 3
@@ -1180,18 +1203,6 @@ def render():
 
         st.markdown("</div>", unsafe_allow_html=True)
 
-        # ── Chips ─────────────────────────────────────────────────────────────
-        CHIPS=["What stock should I buy today?",
-               f"Why is {top_g[0]['symbol'] if top_g else 'MTNN'} moving?",
-               "Explain the current market mood.",
-               "Compare the top 3 gainers.",
-               "Which sector should I watch?"]
-        chip_cols=st.columns(len(CHIPS))
-        for ci,chip in enumerate(CHIPS):
-            with chip_cols[ci]:
-                if st.button(chip,key=f"chip_{ci}",use_container_width=True):
-                    st.session_state.mai_pending=chip; st.rerun()
-
         # ── Chat history ──────────────────────────────────────────────────────
         for _mi,msg in enumerate(st.session_state.mai_history[-8:]):
             if msg["role"]=="user":
@@ -1257,30 +1268,79 @@ def render():
             _r=max(0,15-get_ai_query_count())
             st.caption(f"Starter plan: {_r}/15 queries remaining today. Upgrade to Trader for unlimited.")
 
-        # ── Auto-suggestions (empty chat, non-visitor) ───────────────────────
+        # ── Smart suggested questions — tier-aware, real AI triggers ────────
         if not st.session_state.mai_history and ai_allowed and tier not in ("visitor",):
-            _top_sym=top_g[0]["symbol"] if top_g else "MTNN"
-            _aqs=["What should I buy today?",f"Is {_top_sym} undervalued?","Which sector is strongest?","Top 3 stocks this week"]
-            st.markdown('<div style="font-family:DM Mono,monospace;font-size:10px;color:#505050;margin:6px 0 4px 0;">💡 Try asking:</div>', unsafe_allow_html=True)
-            _aqc=st.columns(4)
-            for _ai2,_aq in enumerate(_aqs):
+            _top_sym  = top_g[0]["symbol"] if top_g else "MTNN"
+            _top2_sym = top_g[1]["symbol"] if len(top_g) > 1 else "GTCO"
+            _last_t   = st.session_state.get("last_ticker_asked", "")
+
+            # Build questions based on tier — each one is a real AI-answerable prompt
+            if tier == "free":
+                _aqs = [
+                    f"Should I buy {_top_sym} today?",
+                    "What is the current market mood on NGX?",
+                    f"Is {_top2_sym} a good stock right now?",
+                    "Which sector is performing best today?",
+                ]
+            elif tier == "trial":
+                _aqs = [
+                    f"Give me a full analysis of {_top_sym} — should I buy, hold or sell?",
+                    f"Compare {_top_sym} and {_top2_sym} — which is the better buy right now?",
+                    "Which NGX sector should I rotate into this week?",
+                    "What are the top 3 stocks to watch today and why?",
+                ]
+            elif tier == "starter":
+                _recall = f"Give me an update on {_last_t} — is it still a buy?" if _last_t else f"What is the entry price for {_top_sym}?"
+                _aqs = [
+                    _recall,
+                    f"Analyse {_top_sym} — give me key signals and a tip.",
+                    "Which sector has the strongest momentum today?",
+                    f"Is {_top2_sym} at a good entry point right now?",
+                ]
+            elif tier == "trader":
+                _recall = f"Update me on {_last_t} — price action, volume and what to do next." if _last_t else f"Give me a trader-level breakdown of {_top_sym}."
+                _aqs = [
+                    _recall,
+                    f"What is the smart money doing in {_top_sym} today?",
+                    "Which NGX stocks are showing unusual volume right now?",
+                    f"Give me entry, stop-loss and target for {_top2_sym}.",
+                ]
+            else:  # pro
+                _recall = f"Full portfolio-level analysis of {_last_t} — risk, entry, target and sector context." if _last_t else f"Give me a Pro-level breakdown of {_top_sym}."
+                _aqs = [
+                    _recall,
+                    f"Which NGX stocks should anchor my portfolio this month and why?",
+                    f"Risk-adjusted position sizing for {_top_sym} — how much should I allocate?",
+                    "Give me sector rotation signals for this week across NGX.",
+                ]
+
+            st.markdown(
+                '<div style="font-family:DM Mono,monospace;font-size:10px;color:#505050;'
+                'margin:8px 0 6px 0;">💡 Suggested questions — click to get an AI answer:</div>',
+                unsafe_allow_html=True
+            )
+            _aqc = st.columns(len(_aqs))
+            for _ai2, _aq in enumerate(_aqs):
                 with _aqc[_ai2]:
-                    if st.button(_aq,key=f"aq_{_ai2}",use_container_width=True): st.session_state.mai_pending=_aq; st.rerun()
+                    if st.button(_aq, key=f"aq_{_ai2}", use_container_width=True):
+                        st.session_state.mai_pending = _aq
+                        st.rerun()
 
         # ── Handle send ───────────────────────────────────────────────────────
         question=(user_q or "").strip()
         if send and question and ai_allowed:
             increment_ai_query_count(); update_streak()
             # ── Track last queried ticker for personalized strip ──────────────
-            _toks = question.upper().split()
-            for _tok in _toks:
-                _clean = _tok.strip("?.,!:;'\"")
-                if any(p.get("symbol","").upper() == _clean for p in uniq):
+            _q_upper = question.upper()
+            for _tok in _q_upper.split():
+                _clean = _tok.strip("?.,!:;'\"()-")
+                if len(_clean) >= 2 and any(
+                    (p.get("symbol") or "").upper() == _clean for p in uniq
+                ):
                     st.session_state["last_ticker_asked"] = _clean
                     st.session_state["last_query_date"]   = date.today()
                     break
             else:
-                # No ticker found in query — still update last_query_date
                 st.session_state["last_query_date"] = date.today()
             prompt_tuple = _build_ai_system_prompt(
                 tier, ad, aarr, acg, mood, gc, lc, total,
@@ -1589,7 +1649,83 @@ def render():
         with c2:
             if st.button("📊 Full Calendar →",key="btn_cal2",type="primary",use_container_width=True): st.session_state.current_page="calendar"; st.rerun()
 
-    # ── 12. BOTTOM CONVERSION BAR ─────────────────────────────────────────────
+    # ── 12. BEGINNER GUIDE ────────────────────────────────────────────────────
+    st.markdown('<div class="sec-title">📚 How to Use NGX Signal — 5-Step Beginner Guide</div>', unsafe_allow_html=True)
+    st.markdown('<div class="sec-intro">New to investing on the Nigerian Stock Exchange? Follow these steps to get the most out of NGX Signal.</div>', unsafe_allow_html=True)
+
+    _guide_steps = [
+        ("Create Your Free Account",
+         "Sign up in 30 seconds — no credit card needed. You automatically get a 14-day Premium Trial with full access to AI signals, daily picks, and market intelligence.",
+         "🔐"),
+        ("Read Today's Signal Scores",
+         "Head to the Signals page. Every NGX stock gets a daily AI score: Strong Buy, Buy, Hold, Caution, or Avoid. Start by reading the top 3 BUY signals and understanding why they're rated that way.",
+         "⭐"),
+        ("Ask the Market AI Your Questions",
+         "Not sure about a stock? Type your question in the AI chat — for example, 'Should I invest in Zenith Bank?' The AI gives you a direct answer with a recommendation, key signals, and an action tip.",
+         "🤖"),
+        ("Watch the Daily AI Picks",
+         "Every trading day at 10 AM WAT, 9 fresh AI-curated picks appear: 3 to Buy, 3 to Hold, 3 to Avoid. These are your daily starting point — always cross-check with your own research before acting.",
+         "📋"),
+        ("Practice First with the Trade Game",
+         "Before using real money, practice on the NGX Trade Game with virtual cash. Place buy and sell orders on real NGX stocks. See how your picks perform without any financial risk.",
+         "🎮"),
+    ]
+
+    for _idx, (_title, _text, _icon) in enumerate(_guide_steps, 1):
+        st.markdown(f"""
+<div class="guide-step">
+  <div class="guide-num">{_idx}</div>
+  <div class="guide-body">
+    <div class="guide-title">{_icon} {_title}</div>
+    <div class="guide-text">{_text}</div>
+  </div>
+</div>""", unsafe_allow_html=True)
+
+    st.markdown("<div style='height:4px'></div>", unsafe_allow_html=True)
+
+    # ── 13. FAQ ───────────────────────────────────────────────────────────────
+    with st.expander("❓  FREQUENTLY ASKED QUESTIONS", expanded=False):
+        _faqs = [
+            ("What is NGX Signal?",
+             "NGX Signal is an AI-powered market intelligence platform for the Nigerian Stock Exchange (NGX). It analyses 144+ NGX-listed stocks daily and produces buy/hold/avoid signals, entry prices, stop-loss levels, and plain-English market analysis — all built specifically for Nigerian investors."),
+            ("Is NGX Signal free to use?",
+             "Yes — you can create a free account at no cost. Free users get 2 AI queries and 5 signal views per day. Every new account also starts with a 14-day Premium Trial, which gives full access to all features including real-time signals, daily AI picks, entry/exit prices, and PDF reports. After the trial, you can continue free or upgrade from ₦3,500/month."),
+            ("How accurate are the AI signals?",
+             "NGX Signal signals are generated from momentum scores, volume analysis, and price action data — not from guessing. Our win rate (signals that hit their target) is tracked transparently on the homepage. All signals are educational only and do not constitute financial advice. Always do your own research before investing."),
+            ("What is the difference between a signal and a recommendation?",
+             "A signal is a data-driven rating (Strong Buy, Buy, Hold, Caution, Avoid) based on technical indicators. A recommendation is what the Market AI gives you when you ask a question — it explains the signal in plain English and adds context like entry range, risk level, and what to watch next. Both are educational only."),
+            ("Which NGX stocks does NGX Signal cover?",
+             "NGX Signal covers all actively traded stocks on the Nigerian Stock Exchange — currently 144+ equities across Banking, Consumer Goods, Telecoms, Oil & Gas, Insurance, Industrial, and more. Signal scores are updated daily after market close."),
+            ("How do I interpret the entry price, target, and stop-loss?",
+             "Entry price is the suggested range to start a position. Target price is where the AI expects the stock to move if the signal plays out. Stop-loss is the level where you should cut losses if the stock moves against you. These are educational reference points — not guaranteed outcomes. Always consult a licensed stockbroker before making investment decisions."),
+            ("Is my money safe with NGX Signal?",
+             "NGX Signal is an intelligence and analysis platform — we do not hold, manage, or invest your money. We do not connect to your brokerage account. All trades you make are done through your own broker independently. The Trade Game uses virtual money only, with zero real financial risk."),
+            ("How do I upgrade from the free plan?",
+             "Go to Settings (or tap 'Start Free Trial' anywhere on the app). Plans start from ₦3,500/month for Starter. All paid plans include a 14-day free trial so you can test full access before committing. Billing is monthly and you can cancel at any time."),
+            ("Does NGX Signal work on mobile?",
+             "Yes — NGX Signal is fully optimised for mobile browsers. Open ngx-signal.streamlit.app in your mobile browser (Chrome, Samsung Internet, Safari) and bookmark it for easy daily access. A dedicated app is on our roadmap."),
+            ("What is the NGX Trade Game?",
+             "The Trade Game is a paper trading simulator. You receive virtual Naira (from ₦500k on the free plan up to ₦10M on Pro) and can buy and sell real NGX stocks without using real money. It's the safest way to practice your strategy and build confidence before trading with real funds."),
+        ]
+
+        for _qi, (_q, _a) in enumerate(_faqs):
+            st.markdown(f"""
+<div class="faq-item" itemscope itemtype="https://schema.org/Question">
+  <div class="faq-q" itemprop="name">{_q} <span style="color:#F0A500;font-size:14px;">+</span></div>
+  <div class="faq-a" itemscope itemtype="https://schema.org/Answer">
+    <div itemprop="text">{_a}</div>
+  </div>
+</div>""", unsafe_allow_html=True)
+
+        st.markdown(f"""
+<div style="font-family:'DM Mono',monospace;font-size:11px;color:#404040;
+            text-align:center;padding:12px 0 4px 0;line-height:1.6;">
+  Still have questions?
+  <span style="color:#F0A500;">Ask the Market AI above</span>
+  or email support@ngxsignal.com
+</div>""", unsafe_allow_html=True)
+
+    # ── 14. BOTTOM CONVERSION BAR ─────────────────────────────────────────────
     st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
 
     if tier in ("visitor","free"):
