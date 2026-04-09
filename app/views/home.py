@@ -959,28 +959,6 @@ def render():
     st.markdown(f'<div class="mg"><div class="mc" style="border-top:2px solid {acol};"><div class="ml">NGX All-Share · {data_label}</div><div class="mv" style="color:{acol};">{ad}</div><div class="ms">{aarr} {abs(acg):.2f}% · {total} stocks</div></div><div class="mc" style="border-top:2px solid #1F1F1F;"><div class="ml">Gainers / Losers</div><div class="mv"><span style="color:#22C55E;">{gc}</span><span style="color:#2A2A2A;font-size:16px;"> / </span><span style="color:#EF4444;">{lc}</span></div><div class="ms">{total-gc-lc} unchanged · {total} total</div></div><div class="mc" style="border-top:2px solid {mcol};"><div class="ml">Market Mood</div><div class="mv" style="font-size:16px;color:{mcol};">{moji} {mood}</div><div class="ms">{"Live breadth" if market["is_open"] else "Based on last close"}</div></div><div class="mc" style="border-top:2px solid {brief_color};"><div class="ml">AI Brief</div><div class="mv" style="font-size:14px;color:{brief_color};">✨ {"Ready" if brief_ok else "Generating..."}</div><div class="ms">Market {"open" if market["is_open"] else "closed"}</div></div></div>', unsafe_allow_html=True)
 
     # ── 5. MARKET AI ─────────────────────────────────────────────────────────
-
-    # ── Opening divider + section title ──────────────────────────────────────
-    st.markdown(f"""
-<div style="display:flex;align-items:center;gap:14px;margin:28px 0 0 0;">
-  <div style="flex:1;height:1px;background:linear-gradient(to right,transparent,#2A2A2A,#F0A50044,#2A2A2A,transparent);"></div>
-  <div style="display:inline-flex;align-items:center;gap:7px;background:rgba(240,165,0,.07);border:1px solid rgba(240,165,0,.25);border-radius:999px;padding:5px 18px;white-space:nowrap;">
-    <span style="font-size:14px;">✨</span>
-    <span style="font-family:'Space Grotesk',sans-serif;font-size:12px;font-weight:700;color:#F0A500;letter-spacing:.06em;text-transform:uppercase;">Stock Market AI</span>
-  </div>
-  <div style="flex:1;height:1px;background:linear-gradient(to left,transparent,#2A2A2A,#F0A50044,#2A2A2A,transparent);"></div>
-</div>
-<div style="text-align:center;margin:10px 0 20px 0;">
-  <div style="font-family:'Space Grotesk',sans-serif;font-size:20px;font-weight:800;color:#FFFFFF;line-height:1.25;margin-bottom:6px;">
-    Ask anything about NGX stocks.<br>Get an instant AI answer.
-  </div>
-  <div style="font-family:'DM Mono',monospace;font-size:12px;color:#606060;line-height:1.7;max-width:480px;margin:0 auto;">
-    Type any stock name or question — the AI analyses live NGX data,<br>signals and market mood to give you a direct, plain-English answer.<br>
-    <span style="color:#404040;">Not financial advice · For educational use only</span>
-  </div>
-</div>
-""", unsafe_allow_html=True)
-
     if "mai_history"  not in st.session_state: st.session_state.mai_history=[]
     if "mai_insights" not in st.session_state: st.session_state.mai_insights={}
     if "mai_pending"  not in st.session_state: st.session_state.mai_pending=""
@@ -1202,15 +1180,6 @@ def render():
                         st.markdown(f'<div style="position:relative;margin-bottom:10px;"><div style="background:#0A0A0A;border:1px solid #1F1F1F;border-left:3px solid {ins["ac"]};border-radius:8px;padding:14px 16px;filter:blur(4px);user-select:none;"><div style="font-size:15px;font-weight:700;color:#FFFFFF;">{ins["sym"]} — {ins["action"]} · {ins["conf"]}%</div><div style="font-size:12px;color:#B0B0B0;margin-top:4px;">{ins["reason"]}</div></div><div style="position:absolute;inset:0;display:flex;align-items:center;justify-content:center;font-family:DM Mono,monospace;font-size:12px;color:#808080;">🔒 Upgrade to see full breakdown</div></div>', unsafe_allow_html=True)
                     else:
                         st.markdown(f'<div style="background:#0A0A0A;border:1px solid #1F1F1F;border-left:3px solid {ins["ac"]};border-radius:8px;padding:14px 16px;margin-bottom:10px;font-family:DM Mono,monospace;"><div style="display:flex;align-items:center;gap:10px;margin-bottom:6px;"><span style="font-family:Space Grotesk,sans-serif;font-size:15px;font-weight:700;color:#FFFFFF;">{ins["sym"]}</span><span style="background:{ins["bg"]};color:{ins["ac"]};font-size:10px;font-weight:700;padding:3px 10px;border-radius:999px;">{ins["action"]}</span><span style="color:{ins["ac"]};font-size:13px;font-weight:600;margin-left:auto;">{ins["conf"]}% confidence</span></div><div style="font-size:12px;color:#B0B0B0;line-height:1.65;">{ins["reason"]}</div></div>', unsafe_allow_html=True)
-
-    # ── Closing divider after AI section ─────────────────────────────────────
-    st.markdown("""
-<div style="display:flex;align-items:center;gap:14px;margin:28px 0 24px 0;">
-  <div style="flex:1;height:1px;background:linear-gradient(to right,transparent,#2A2A2A,#F0A50022,#2A2A2A,transparent);"></div>
-  <div style="font-family:'DM Mono',monospace;font-size:10px;color:#303030;letter-spacing:.12em;text-transform:uppercase;white-space:nowrap;">end of ai section</div>
-  <div style="flex:1;height:1px;background:linear-gradient(to left,transparent,#2A2A2A,#F0A50022,#2A2A2A,transparent);"></div>
-</div>
-""", unsafe_allow_html=True)
 
     # ── DAILY AI PICKS ────────────────────────────────────────────────────────
     _pk=f"daily_picks_{_daily_seed()}"
