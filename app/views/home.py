@@ -622,152 +622,6 @@ def _render_downgrade_modal(name: str, stats: dict):
         st.session_state.current_page = "settings"; st.rerun()
 
 # ══════════════════════════════════════════════════════════════════════════════
-# PERSONALIZED GREETING STRIP
-# ══════════════════════════════════════════════════════════════════════════════
-
-def render_personalized_strip(tier: str, profile: dict, name: str, uniq: list) -> None:
-    """
-    Slim one-line personalized context bar rendered immediately after the
-    greeting block. Invisible to visitors. Each tier sees different content.
-    """
-    if tier == "visitor":
-        return
-
-    # ── Shared data ───────────────────────────────────────────────────────────
-    last_ticker = (st.session_state.get("last_ticker_asked") or "").strip().upper()
-    ticker_data = next(
-        (p for p in uniq if (p.get("symbol") or "").upper() == last_ticker),
-        None
-    ) if last_ticker else None
-    chg       = float(ticker_data.get("change_percent", 0)) if ticker_data else None
-    chg_str   = (f"+{chg:.2f}% ▲" if chg >= 0 else f"{chg:.2f}% ▼") if chg is not None else None
-    chg_color = ("#22C55E" if chg >= 0 else "#EF4444") if chg is not None else "#F0A500"
-
-    last_date    = st.session_state.get("last_query_date")
-    if last_date and not isinstance(last_date, date):
-        try:    last_date = date.fromisoformat(str(last_date))
-        except: last_date = None
-    days_ago     = (date.today() - last_date).days if last_date else None
-    days_ago_str = (f"{days_ago} day{'s' if days_ago != 1 else ''} ago") if days_ago is not None else "recently"
-
-    used_today  = get_ai_query_count()
-    streak      = get_streak()
-    streak_html = (f'🔥 <span style="color:#F0A500;font-weight:700;">{streak}-day streak</span>'
-                   if streak >= 2 else '<span style="color:#404040;">no streak yet</span>')
-
-    # ── Strip CSS ─────────────────────────────────────────────────────────────
-    st.markdown("""
-<style>
-.ps-strip{
-  display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:6px;
-  background:#080808;border:1px solid #1F1F1F;border-left:3px solid #F0A500;
-  border-radius:10px;padding:10px 16px;margin-bottom:12px;
-  font-family:'DM Mono',monospace;font-size:12px;color:#C0C0C0;
-  animation:notif-slide .35s ease both;
-}
-.ps-gold{color:#F0A500;font-weight:700;}
-.ps-white{color:#FFFFFF;font-weight:600;}
-.ps-dim{color:#606060;}
-.ps-right{font-size:10px;color:#404040;white-space:nowrap;}
-</style>""", unsafe_allow_html=True)
-
-    show_upgrade_btn = False
-    upgrade_key      = f"ps_upgrade_{tier}"
-
-    # ── FREE ──────────────────────────────────────────────────────────────────
-    if tier == "free":
-        limit = get_usage_limit("ai_queries", "free") or 2
-        if used_today == 0:
-            msg = (f'👋 Welcome back, <span class="ps-gold">{name}</span>. '
-                   f'You have <span class="ps-white">{limit} free AI queries</span> '
-                   f'today — ask your first question below.')
-            right = ""
-        else:
-            rem = max(0, limit - used_today)
-            msg = (f'⚡ <span class="ps-gold">{name}</span> — used '
-                   f'<span class="ps-white">{used_today}</span> of '
-                   f'<span class="ps-white">{limit}</span> free queries today. '
-                   f'Upgrade for unlimited AI access.')
-            right = '<span class="ps-right">Upgrade ↗</span>'
-            show_upgrade_btn = (rem == 0)
-        st.markdown(f'<div class="ps-strip"><span>{msg}</span>{right}</div>',
-                    unsafe_allow_html=True)
-
-    # ── TRIAL ─────────────────────────────────────────────────────────────────
-    elif tier == "trial":
-        trial_day_num = get_trial_day_number(profile)
-        total_q       = get_total_ai_queries()
-        if last_ticker and ticker_data and chg is not None:
-            msg = (f'📡 <span class="ps-gold">{name}</span>, '
-                   f'<span class="ps-white">{last_ticker}</span> is '
-                   f'<span style="color:{chg_color};font-weight:700;">{chg_str}</span> '
-                   f'today — you asked about it '
-                   f'<span class="ps-white">{days_ago_str}</span>.')
-        else:
-            msg = (f'✨ Trial Day <span class="ps-white">{trial_day_num}</span> of 14 — '
-                   f'<span class="ps-white">{total_q}</span> AI queries used. '
-                   f'Your full market edge is live. Ask anything below.')
-        st.markdown(f'<div class="ps-strip"><span>{msg}</span></div>',
-                    unsafe_allow_html=True)
-
-    # ── STARTER ───────────────────────────────────────────────────────────────
-    elif tier == "starter":
-        limit = 15
-        rem   = max(0, limit - used_today)
-        if last_ticker and ticker_data and chg is not None:
-            msg = (f'📊 <span class="ps-gold">{last_ticker}</span>: '
-                   f'<span style="color:{chg_color};font-weight:700;">{chg_str}</span> today'
-                   f' &nbsp;·&nbsp; <span class="ps-white">{rem}/{limit}</span> queries left'
-                   f' &nbsp;·&nbsp; Streak: {streak_html}')
-        else:
-            msg = (f'📊 <span class="ps-gold">{name}</span>'
-                   f' &nbsp;·&nbsp; <span class="ps-white">{rem}/{limit}</span> queries left today'
-                   f' &nbsp;·&nbsp; Streak: {streak_html}')
-        right = '<span class="ps-right">Upgrade ↗</span>' if rem == 0 else ""
-        show_upgrade_btn = (rem == 0)
-        st.markdown(f'<div class="ps-strip"><span>{msg}</span>{right}</div>',
-                    unsafe_allow_html=True)
-
-    # ── TRADER ────────────────────────────────────────────────────────────────
-    elif tier == "trader":
-        if last_ticker and ticker_data and chg is not None:
-            msg = (f'📡 <span class="ps-gold">{last_ticker}</span> is '
-                   f'<span style="color:{chg_color};font-weight:700;">{chg_str}</span> today'
-                   f' &nbsp;·&nbsp; Unlimited queries'
-                   f' &nbsp;·&nbsp; Streak: {streak_html}'
-                   f' &nbsp;·&nbsp; <span class="ps-dim">🇳🇬 Pidgin mode available</span>')
-        else:
-            msg = (f'✨ <span class="ps-gold">{name}</span>'
-                   f' &nbsp;·&nbsp; Unlimited queries'
-                   f' &nbsp;·&nbsp; Streak: {streak_html}'
-                   f' &nbsp;·&nbsp; Full NGX intelligence unlocked')
-        st.markdown(f'<div class="ps-strip"><span>{msg}</span></div>',
-                    unsafe_allow_html=True)
-
-    # ── PRO ───────────────────────────────────────────────────────────────────
-    elif tier == "pro":
-        if last_ticker and ticker_data and chg is not None:
-            msg = (f'🏆 <span class="ps-gold">PRO</span>'
-                   f' &nbsp;·&nbsp; <span class="ps-white">{last_ticker}</span>: '
-                   f'<span style="color:{chg_color};font-weight:700;">{chg_str}</span> today'
-                   f' &nbsp;·&nbsp; Unlimited AI'
-                   f' &nbsp;·&nbsp; PDF exports ready'
-                   f' &nbsp;·&nbsp; Advanced outputs on')
-        else:
-            msg = (f'🏆 <span class="ps-gold">PRO</span>'
-                   f' &nbsp;·&nbsp; <span class="ps-white">{name}</span>'
-                   f' &nbsp;·&nbsp; Unlimited AI &nbsp;·&nbsp; PDF exports'
-                   f' &nbsp;·&nbsp; Advanced outputs &nbsp;·&nbsp; Full intelligence active')
-        st.markdown(f'<div class="ps-strip"><span>{msg}</span></div>',
-                    unsafe_allow_html=True)
-
-    # ── Upgrade nudge button (hidden label, only for free/starter at limit) ──
-    if show_upgrade_btn:
-        if st.button("Upgrade now →", key=upgrade_key, type="primary"):
-            st.session_state.current_page = "settings"; st.rerun()
-
-
-# ══════════════════════════════════════════════════════════════════════════════
 # MAIN RENDER
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -1002,9 +856,6 @@ def render():
   {now.strftime("%A, %d %B %Y")} · {now.strftime("%I:%M %p")} WAT
 </div>""", unsafe_allow_html=True)
 
-    # ── PERSONALIZED GREETING STRIP ──────────────────────────────────────────
-    render_personalized_strip(tier, profile, name, uniq)
-
     # ── NOTIFICATION BANNER ───────────────────────────────────────────────────
     _notif_minutes = (now.hour * 60 + now.minute) % 137 + 3
     if top_g:
@@ -1108,6 +959,28 @@ def render():
     st.markdown(f'<div class="mg"><div class="mc" style="border-top:2px solid {acol};"><div class="ml">NGX All-Share · {data_label}</div><div class="mv" style="color:{acol};">{ad}</div><div class="ms">{aarr} {abs(acg):.2f}% · {total} stocks</div></div><div class="mc" style="border-top:2px solid #1F1F1F;"><div class="ml">Gainers / Losers</div><div class="mv"><span style="color:#22C55E;">{gc}</span><span style="color:#2A2A2A;font-size:16px;"> / </span><span style="color:#EF4444;">{lc}</span></div><div class="ms">{total-gc-lc} unchanged · {total} total</div></div><div class="mc" style="border-top:2px solid {mcol};"><div class="ml">Market Mood</div><div class="mv" style="font-size:16px;color:{mcol};">{moji} {mood}</div><div class="ms">{"Live breadth" if market["is_open"] else "Based on last close"}</div></div><div class="mc" style="border-top:2px solid {brief_color};"><div class="ml">AI Brief</div><div class="mv" style="font-size:14px;color:{brief_color};">✨ {"Ready" if brief_ok else "Generating..."}</div><div class="ms">Market {"open" if market["is_open"] else "closed"}</div></div></div>', unsafe_allow_html=True)
 
     # ── 5. MARKET AI ─────────────────────────────────────────────────────────
+
+    # ── Opening divider + section title ──────────────────────────────────────
+    st.markdown(f"""
+<div style="display:flex;align-items:center;gap:14px;margin:28px 0 0 0;">
+  <div style="flex:1;height:1px;background:linear-gradient(to right,transparent,#2A2A2A,#F0A50044,#2A2A2A,transparent);"></div>
+  <div style="display:inline-flex;align-items:center;gap:7px;background:rgba(240,165,0,.07);border:1px solid rgba(240,165,0,.25);border-radius:999px;padding:5px 18px;white-space:nowrap;">
+    <span style="font-size:14px;">✨</span>
+    <span style="font-family:'Space Grotesk',sans-serif;font-size:12px;font-weight:700;color:#F0A500;letter-spacing:.06em;text-transform:uppercase;">Stock Market AI</span>
+  </div>
+  <div style="flex:1;height:1px;background:linear-gradient(to left,transparent,#2A2A2A,#F0A50044,#2A2A2A,transparent);"></div>
+</div>
+<div style="text-align:center;margin:10px 0 20px 0;">
+  <div style="font-family:'Space Grotesk',sans-serif;font-size:20px;font-weight:800;color:#FFFFFF;line-height:1.25;margin-bottom:6px;">
+    Ask anything about NGX stocks.<br>Get an instant AI answer.
+  </div>
+  <div style="font-family:'DM Mono',monospace;font-size:12px;color:#606060;line-height:1.7;max-width:480px;margin:0 auto;">
+    Type any stock name or question — the AI analyses live NGX data,<br>signals and market mood to give you a direct, plain-English answer.<br>
+    <span style="color:#404040;">Not financial advice · For educational use only</span>
+  </div>
+</div>
+""", unsafe_allow_html=True)
+
     if "mai_history"  not in st.session_state: st.session_state.mai_history=[]
     if "mai_insights" not in st.session_state: st.session_state.mai_insights={}
     if "mai_pending"  not in st.session_state: st.session_state.mai_pending=""
@@ -1203,6 +1076,18 @@ def render():
 
         st.markdown("</div>", unsafe_allow_html=True)
 
+        # ── Chips ─────────────────────────────────────────────────────────────
+        CHIPS=["What stock should I buy today?",
+               f"Why is {top_g[0]['symbol'] if top_g else 'MTNN'} moving?",
+               "Explain the current market mood.",
+               "Compare the top 3 gainers.",
+               "Which sector should I watch?"]
+        chip_cols=st.columns(len(CHIPS))
+        for ci,chip in enumerate(CHIPS):
+            with chip_cols[ci]:
+                if st.button(chip,key=f"chip_{ci}",use_container_width=True):
+                    st.session_state.mai_pending=chip; st.rerun()
+
         # ── Chat history ──────────────────────────────────────────────────────
         for _mi,msg in enumerate(st.session_state.mai_history[-8:]):
             if msg["role"]=="user":
@@ -1268,80 +1153,20 @@ def render():
             _r=max(0,15-get_ai_query_count())
             st.caption(f"Starter plan: {_r}/15 queries remaining today. Upgrade to Trader for unlimited.")
 
-        # ── Smart suggested questions — tier-aware, real AI triggers ────────
+        # ── Auto-suggestions (empty chat, non-visitor) ───────────────────────
         if not st.session_state.mai_history and ai_allowed and tier not in ("visitor",):
-            _top_sym  = top_g[0]["symbol"] if top_g else "MTNN"
-            _top2_sym = top_g[1]["symbol"] if len(top_g) > 1 else "GTCO"
-            _last_t   = st.session_state.get("last_ticker_asked", "")
-
-            # Build questions based on tier — each one is a real AI-answerable prompt
-            if tier == "free":
-                _aqs = [
-                    f"Should I buy {_top_sym} today?",
-                    "What is the current market mood on NGX?",
-                    f"Is {_top2_sym} a good stock right now?",
-                    "Which sector is performing best today?",
-                ]
-            elif tier == "trial":
-                _aqs = [
-                    f"Give me a full analysis of {_top_sym} — should I buy, hold or sell?",
-                    f"Compare {_top_sym} and {_top2_sym} — which is the better buy right now?",
-                    "Which NGX sector should I rotate into this week?",
-                    "What are the top 3 stocks to watch today and why?",
-                ]
-            elif tier == "starter":
-                _recall = f"Give me an update on {_last_t} — is it still a buy?" if _last_t else f"What is the entry price for {_top_sym}?"
-                _aqs = [
-                    _recall,
-                    f"Analyse {_top_sym} — give me key signals and a tip.",
-                    "Which sector has the strongest momentum today?",
-                    f"Is {_top2_sym} at a good entry point right now?",
-                ]
-            elif tier == "trader":
-                _recall = f"Update me on {_last_t} — price action, volume and what to do next." if _last_t else f"Give me a trader-level breakdown of {_top_sym}."
-                _aqs = [
-                    _recall,
-                    f"What is the smart money doing in {_top_sym} today?",
-                    "Which NGX stocks are showing unusual volume right now?",
-                    f"Give me entry, stop-loss and target for {_top2_sym}.",
-                ]
-            else:  # pro
-                _recall = f"Full portfolio-level analysis of {_last_t} — risk, entry, target and sector context." if _last_t else f"Give me a Pro-level breakdown of {_top_sym}."
-                _aqs = [
-                    _recall,
-                    f"Which NGX stocks should anchor my portfolio this month and why?",
-                    f"Risk-adjusted position sizing for {_top_sym} — how much should I allocate?",
-                    "Give me sector rotation signals for this week across NGX.",
-                ]
-
-            st.markdown(
-                '<div style="font-family:DM Mono,monospace;font-size:10px;color:#505050;'
-                'margin:8px 0 6px 0;">💡 Suggested questions — click to get an AI answer:</div>',
-                unsafe_allow_html=True
-            )
-            _aqc = st.columns(len(_aqs))
-            for _ai2, _aq in enumerate(_aqs):
+            _top_sym=top_g[0]["symbol"] if top_g else "MTNN"
+            _aqs=["What should I buy today?",f"Is {_top_sym} undervalued?","Which sector is strongest?","Top 3 stocks this week"]
+            st.markdown('<div style="font-family:DM Mono,monospace;font-size:10px;color:#505050;margin:6px 0 4px 0;">💡 Try asking:</div>', unsafe_allow_html=True)
+            _aqc=st.columns(4)
+            for _ai2,_aq in enumerate(_aqs):
                 with _aqc[_ai2]:
-                    if st.button(_aq, key=f"aq_{_ai2}", use_container_width=True):
-                        st.session_state.mai_pending = _aq
-                        st.rerun()
+                    if st.button(_aq,key=f"aq_{_ai2}",use_container_width=True): st.session_state.mai_pending=_aq; st.rerun()
 
         # ── Handle send ───────────────────────────────────────────────────────
         question=(user_q or "").strip()
         if send and question and ai_allowed:
             increment_ai_query_count(); update_streak()
-            # ── Track last queried ticker for personalized strip ──────────────
-            _q_upper = question.upper()
-            for _tok in _q_upper.split():
-                _clean = _tok.strip("?.,!:;'\"()-")
-                if len(_clean) >= 2 and any(
-                    (p.get("symbol") or "").upper() == _clean for p in uniq
-                ):
-                    st.session_state["last_ticker_asked"] = _clean
-                    st.session_state["last_query_date"]   = date.today()
-                    break
-            else:
-                st.session_state["last_query_date"] = date.today()
             prompt_tuple = _build_ai_system_prompt(
                 tier, ad, aarr, acg, mood, gc, lc, total,
                 top_g_text, latest_date, market["is_open"],
@@ -1377,6 +1202,15 @@ def render():
                         st.markdown(f'<div style="position:relative;margin-bottom:10px;"><div style="background:#0A0A0A;border:1px solid #1F1F1F;border-left:3px solid {ins["ac"]};border-radius:8px;padding:14px 16px;filter:blur(4px);user-select:none;"><div style="font-size:15px;font-weight:700;color:#FFFFFF;">{ins["sym"]} — {ins["action"]} · {ins["conf"]}%</div><div style="font-size:12px;color:#B0B0B0;margin-top:4px;">{ins["reason"]}</div></div><div style="position:absolute;inset:0;display:flex;align-items:center;justify-content:center;font-family:DM Mono,monospace;font-size:12px;color:#808080;">🔒 Upgrade to see full breakdown</div></div>', unsafe_allow_html=True)
                     else:
                         st.markdown(f'<div style="background:#0A0A0A;border:1px solid #1F1F1F;border-left:3px solid {ins["ac"]};border-radius:8px;padding:14px 16px;margin-bottom:10px;font-family:DM Mono,monospace;"><div style="display:flex;align-items:center;gap:10px;margin-bottom:6px;"><span style="font-family:Space Grotesk,sans-serif;font-size:15px;font-weight:700;color:#FFFFFF;">{ins["sym"]}</span><span style="background:{ins["bg"]};color:{ins["ac"]};font-size:10px;font-weight:700;padding:3px 10px;border-radius:999px;">{ins["action"]}</span><span style="color:{ins["ac"]};font-size:13px;font-weight:600;margin-left:auto;">{ins["conf"]}% confidence</span></div><div style="font-size:12px;color:#B0B0B0;line-height:1.65;">{ins["reason"]}</div></div>', unsafe_allow_html=True)
+
+    # ── Closing divider after AI section ─────────────────────────────────────
+    st.markdown("""
+<div style="display:flex;align-items:center;gap:14px;margin:28px 0 24px 0;">
+  <div style="flex:1;height:1px;background:linear-gradient(to right,transparent,#2A2A2A,#F0A50022,#2A2A2A,transparent);"></div>
+  <div style="font-family:'DM Mono',monospace;font-size:10px;color:#303030;letter-spacing:.12em;text-transform:uppercase;white-space:nowrap;">end of ai section</div>
+  <div style="flex:1;height:1px;background:linear-gradient(to left,transparent,#2A2A2A,#F0A50022,#2A2A2A,transparent);"></div>
+</div>
+""", unsafe_allow_html=True)
 
     # ── DAILY AI PICKS ────────────────────────────────────────────────────────
     _pk=f"daily_picks_{_daily_seed()}"
