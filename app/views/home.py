@@ -623,6 +623,260 @@ def _render_downgrade_modal(name: str, stats: dict):
         st.session_state.current_page = "settings"; st.rerun()
 
 # ══════════════════════════════════════════════════════════════════════════════
+# SHARE SHEET — AI RECOMMENDATION
+# Renders a bottom-sheet share card after a decision-type AI response.
+# Called once per assistant message that contains a Recommendation line.
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _extract_recommendation(text: str) -> tuple[str, str]:
+    """
+    Pull the Recommendation line and emoji from an AI response.
+    Returns (label, emoji) e.g. ("BUY", "✅") or ("", "")
+    """
+    for line in text.split("\n"):
+        l = line.strip()
+        if l.lower().startswith("recommendation:"):
+            body = l[len("recommendation:"):].strip()
+            if "BUY" in body.upper() and "AVOID" not in body.upper() and "STRONG" not in body.upper():
+                return "BUY", "✅"
+            elif "STRONG BUY" in body.upper() or "STRONG_BUY" in body.upper():
+                return "STRONG BUY", "⭐"
+            elif "HOLD" in body.upper():
+                return "HOLD", "⚖️"
+            elif "AVOID" in body.upper():
+                return "AVOID", "❌"
+            elif "CAUTION" in body.upper():
+                return "CAUTION", "⚠️"
+    return "", ""
+
+def _render_ai_share_sheet(
+    question:    str,
+    answer:      str,
+    ticker:      str,
+    sheet_key:   str,
+) -> None:
+    """
+    Renders a 'Share this insight' button. When clicked, shows a JS bottom sheet
+    with WhatsApp, X/Twitter, Copy, and Close options.
+
+    The share card text is pre-formatted as:
+      📊 NGX Signal AI — [TICKER]
+      Recommendation: [LABEL] [EMOJI]
+      "[one-line key insight from the answer]"
+      Analysed by NGX Signal · ngxsignal.com
+    """
+    rec_label, rec_emoji = _extract_recommendation(answer)
+    if not rec_label:
+        return  # Only show share for decision-type responses
+
+    # Extract first meaningful non-recommendation sentence as the key insight
+    insight = ""
+    for line in answer.split("\n"):
+        l = line.strip()
+        if (l and not l.lower().startswith("recommendation:")
+                and not l.startswith("*") and len(l) > 30):
+            # Clean markdown
+            l = re.sub(r'\*\*(.+?)\*\*', r'\1', l)
+            l = re.sub(r'_(.+?)_', r'\1', l)
+            insight = l[:120] + ("…" if len(l) > 120 else "")
+            break
+
+    ticker_display = ticker.upper() if ticker else "this stock"
+
+    # Colour for the rec label
+    rec_color = {
+        "STRONG BUY": "#16A34A",
+        "BUY":        "#22C55E",
+        "HOLD":       "#D97706",
+        "CAUTION":    "#EA580C",
+        "AVOID":      "#DC2626",
+    }.get(rec_label, "#F0A500")
+
+    # Pre-build the share text strings (URL-encoded inline in JS)
+    share_text = (
+        f"📊 NGX Signal AI — {ticker_display}\n"
+        f"Recommendation: {rec_label} {rec_emoji}\n"
+        f'"{insight}"\n\n'
+        f"Analysed by NGX Signal\n"
+        f"👉 ngxsignal.com"
+    )
+    app_url = "https://ngxsignal.com"
+
+    # Card preview (HTML — shown inside the sheet)
+    preview_html = (
+        f'<div style="font-size:10px;color:#808080;margin-bottom:6px;'
+        f'text-transform:uppercase;letter-spacing:.07em;">NGX Signal AI · {ticker_display}</div>'
+        f'<div style="font-size:14px;font-weight:700;color:{rec_color};margin-bottom:6px;">'
+        f'{rec_label} {rec_emoji}</div>'
+        f'<div style="font-size:11px;color:#C0C0C0;line-height:1.6;margin-bottom:8px;">"{insight}"</div>'
+        f'<div style="font-size:10px;color:#404040;">Analysed by NGX Signal · ngxsignal.com</div>'
+    )
+
+    # Trigger button + sheet rendered together in a single HTML component
+    # The sheet is hidden by default; JS toggles it
+    uid = sheet_key.replace("-", "_")
+
+    st.components.v1.html(f"""
+<!DOCTYPE html><html>
+<head>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+*{{margin:0;padding:0;box-sizing:border-box;}}
+body{{background:transparent;font-family:'DM Mono',monospace;overflow:hidden;}}
+
+/* Share trigger button */
+.shr-trigger{{
+  display:inline-flex;align-items:center;gap:7px;
+  background:rgba(240,165,0,.07);border:1px solid rgba(240,165,0,.25);
+  border-radius:8px;padding:7px 14px;cursor:pointer;
+  font-family:'DM Mono',monospace;font-size:11px;color:#F0A500;
+  transition:background .15s,border-color .15s;margin-top:6px;
+}}
+.shr-trigger:hover{{background:rgba(240,165,0,.12);border-color:rgba(240,165,0,.5);}}
+
+/* Backdrop */
+.shr-backdrop{{
+  display:none;position:fixed;inset:0;z-index:99990;
+  background:rgba(0,0,0,.75);backdrop-filter:blur(4px);
+  animation:shr-fade-in .2s ease both;
+}}
+/* Sheet */
+.shr-sheet{{
+  display:none;position:fixed;bottom:0;left:0;right:0;z-index:99999;
+  background:#0E0E0E;border-top:1px solid #2A2A2A;
+  border-radius:20px 20px 0 0;padding:0 0 env(safe-area-inset-bottom,24px) 0;
+  animation:shr-slide-up .28s cubic-bezier(.16,1,.3,1) both;
+  max-width:520px;margin:0 auto;
+}}
+.shr-handle{{width:40px;height:4px;background:#2A2A2A;border-radius:2px;margin:12px auto 16px;}}
+.shr-title{{font-family:'DM Mono',monospace;font-size:12px;font-weight:700;
+            color:#FFFFFF;text-align:center;margin-bottom:4px;}}
+.shr-subtitle{{font-family:'DM Mono',monospace;font-size:10px;color:#505050;
+               text-align:center;margin-bottom:16px;letter-spacing:.04em;}}
+.shr-preview{{background:#0A0A0A;border:1px solid #1F1F1F;border-left:3px solid #F0A500;
+              border-radius:10px;padding:12px 16px;margin:0 16px 16px;
+              font-family:'DM Mono',monospace;}}
+.shr-options{{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;padding:0 16px 12px;}}
+.shr-btn{{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:6px;
+          background:#141414;border:1px solid #222;border-radius:12px;padding:14px 8px;
+          cursor:pointer;font-family:'DM Mono',monospace;font-size:11px;color:#A0A0A0;
+          text-decoration:none;transition:all .15s;}}
+.shr-btn:hover{{background:#1A1A1A;border-color:#3A3A3A;color:#FFFFFF;}}
+.shr-btn-icon{{font-size:24px;line-height:1;}}
+.shr-btn-wa{{border-color:rgba(37,211,102,.2);}}
+.shr-btn-wa:hover{{border-color:#25D366;background:rgba(37,211,102,.07);color:#25D366;}}
+.shr-btn-x{{border-color:rgba(255,255,255,.1);}}
+.shr-btn-x:hover{{border-color:#fff;background:rgba(255,255,255,.05);color:#fff;}}
+.shr-btn-copy{{border-color:rgba(240,165,0,.2);}}
+.shr-btn-copy:hover{{border-color:#F0A500;background:rgba(240,165,0,.06);color:#F0A500;}}
+.shr-close{{width:calc(100% - 32px);margin:4px 16px 0;background:transparent;
+            border:1px solid #1F1F1F;border-radius:10px;padding:12px;
+            font-family:'DM Mono',monospace;font-size:12px;color:#505050;cursor:pointer;
+            transition:all .15s;}}
+.shr-close:hover{{color:#FFFFFF;border-color:#3A3A3A;}}
+.copied-flash{{display:none;position:absolute;top:-28px;left:50%;transform:translateX(-50%);
+               background:#F0A500;color:#000;font-size:10px;font-weight:700;
+               padding:3px 10px;border-radius:6px;white-space:nowrap;}}
+@keyframes shr-slide-up{{from{{transform:translateY(100%);}}to{{transform:translateY(0);}}}}
+@keyframes shr-fade-in{{from{{opacity:0;}}to{{opacity:1;}}}}
+</style>
+</head>
+<body>
+
+<!-- Trigger button -->
+<button class="shr-trigger" onclick="openSheet_{uid}()">
+  ↗ Share this insight
+</button>
+
+<!-- Backdrop -->
+<div class="shr-backdrop" id="bd_{uid}" onclick="closeSheet_{uid}()"></div>
+
+<!-- Bottom sheet -->
+<div class="shr-sheet" id="sh_{uid}">
+  <div class="shr-handle"></div>
+  <div class="shr-title">Share this AI insight</div>
+  <div class="shr-subtitle">NGX Signal · {ticker_display} · {rec_label} {rec_emoji}</div>
+
+  <!-- Card preview -->
+  <div class="shr-preview">{preview_html}</div>
+
+  <!-- Share options -->
+  <div class="shr-options">
+    <!-- WhatsApp -->
+    <a class="shr-btn shr-btn-wa"
+       href="https://wa.me/?text={requests.utils.quote(share_text)}"
+       target="_blank" rel="noopener"
+       onclick="closeSheet_{uid}()">
+      <span class="shr-btn-icon">💬</span>
+      <span>WhatsApp</span>
+    </a>
+
+    <!-- X / Twitter -->
+    <a class="shr-btn shr-btn-x"
+       href="https://twitter.com/intent/tweet?text={requests.utils.quote(share_text)}"
+       target="_blank" rel="noopener"
+       onclick="closeSheet_{uid}()">
+      <span class="shr-btn-icon">𝕏</span>
+      <span>X / Twitter</span>
+    </a>
+
+    <!-- Copy text -->
+    <button class="shr-btn shr-btn-copy" onclick="copyText_{uid}()" style="position:relative;">
+      <span class="copied-flash" id="cp_flash_{uid}">Copied!</span>
+      <span class="shr-btn-icon">📋</span>
+      <span id="cp_lbl_{uid}">Copy text</span>
+    </button>
+  </div>
+
+  <button class="shr-close" onclick="closeSheet_{uid}()">✕ Close</button>
+</div>
+
+<script>
+var _shareText_{uid} = {repr(share_text)};
+
+function openSheet_{uid}() {{
+  document.getElementById('bd_{uid}').style.display = 'block';
+  document.getElementById('sh_{uid}').style.display = 'block';
+  // Tell Streamlit iframe to grow so sheet is visible
+  window.parent.postMessage({{type:'streamlit:setFrameHeight', height: 520}}, '*');
+}}
+function closeSheet_{uid}() {{
+  document.getElementById('bd_{uid}').style.display = 'none';
+  document.getElementById('sh_{uid}').style.display = 'none';
+  window.parent.postMessage({{type:'streamlit:setFrameHeight', height: 40}}, '*');
+}}
+function copyText_{uid}() {{
+  if (navigator.clipboard && navigator.clipboard.writeText) {{
+    navigator.clipboard.writeText(_shareText_{uid}).then(function() {{
+      showCopied_{uid}();
+    }});
+  }} else {{
+    // Fallback
+    var ta = document.createElement('textarea');
+    ta.value = _shareText_{uid};
+    ta.style.position = 'fixed'; ta.style.opacity = '0';
+    document.body.appendChild(ta); ta.select();
+    try {{ document.execCommand('copy'); showCopied_{uid}(); }} catch(e) {{}}
+    document.body.removeChild(ta);
+  }}
+}}
+function showCopied_{uid}() {{
+  var fl = document.getElementById('cp_flash_{uid}');
+  var lb = document.getElementById('cp_lbl_{uid}');
+  fl.style.display = 'block'; lb.textContent = 'Copied!';
+  setTimeout(function() {{
+    fl.style.display = 'none'; lb.textContent = 'Copy text';
+  }}, 2000);
+  setTimeout(function() {{ closeSheet_{uid}(); }}, 2200);
+}}
+// Resize iframe to just show the trigger button by default
+window.parent.postMessage({{type:'streamlit:setFrameHeight', height: 40}}, '*');
+</script>
+</body></html>
+""", height=42, scrolling=False)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # PERSONALIZED CONTEXT STRIP
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -913,6 +1167,25 @@ def render():
 .pro-badge{display:inline-flex;align-items:center;gap:5px;background:rgba(240,165,0,.12);border:1px solid rgba(240,165,0,.3);border-radius:999px;padding:2px 10px;font-family:'DM Mono',monospace;font-size:10px;font-weight:700;color:#F0A500;letter-spacing:.05em;}
 @media(min-width:769px){.sticky-upgrade{display:none;}}
 @media(max-width:768px){.mg{grid-template-columns:repeat(2,1fr);}.sp-grid,.dap-grid,.highlight-ribbon{grid-template-columns:1fr;}.hero-h1{font-size:24px;}.ai-msg-user{margin-left:5%;}}
+/* ── Share sheet ── */
+.shr-backdrop{position:fixed;inset:0;z-index:99990;background:rgba(0,0,0,.72);backdrop-filter:blur(4px);animation:shr-fade-in .2s ease both;}
+.shr-sheet{position:fixed;bottom:0;left:0;right:0;z-index:99999;background:#0E0E0E;border-top:1px solid #2A2A2A;border-radius:20px 20px 0 0;padding:0 0 32px 0;animation:shr-slide-up .28s cubic-bezier(.16,1,.3,1) both;max-width:520px;margin:0 auto;}
+.shr-handle{width:40px;height:4px;background:#2A2A2A;border-radius:2px;margin:12px auto 18px;}
+.shr-title{font-family:'Space Grotesk',sans-serif;font-size:13px;font-weight:700;color:#FFFFFF;text-align:center;margin-bottom:6px;}
+.shr-subtitle{font-family:'DM Mono',monospace;font-size:10px;color:#505050;text-align:center;margin-bottom:20px;letter-spacing:.04em;}
+.shr-card-preview{background:#0A0A0A;border:1px solid #1F1F1F;border-left:3px solid #F0A500;border-radius:10px;padding:12px 16px;margin:0 16px 20px;font-family:'DM Mono',monospace;font-size:11px;color:#C0C0C0;line-height:1.65;}
+.shr-options{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;padding:0 16px 12px;}
+.shr-btn{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:6px;background:#141414;border:1px solid #222;border-radius:12px;padding:14px 8px;cursor:pointer;font-family:'DM Mono',monospace;font-size:10px;color:#A0A0A0;transition:border-color .15s,background .15s;text-decoration:none;}
+.shr-btn:hover,.shr-btn:active{background:#1A1A1A;border-color:#3A3A3A;color:#FFFFFF;}
+.shr-btn-icon{font-size:22px;}
+.shr-btn-wa{border-color:rgba(37,211,102,.25);}.shr-btn-wa:hover{border-color:#25D366;background:rgba(37,211,102,.06);}
+.shr-btn-x{border-color:rgba(255,255,255,.12);}.shr-btn-x:hover{border-color:#fff;background:rgba(255,255,255,.04);}
+.shr-btn-copy{border-color:rgba(240,165,0,.2);}.shr-btn-copy:hover{border-color:#F0A500;background:rgba(240,165,0,.06);}
+.shr-close-row{padding:0 16px;margin-top:4px;}
+.shr-close-btn{width:100%;background:transparent;border:1px solid #1F1F1F;border-radius:10px;padding:12px;font-family:'DM Mono',monospace;font-size:12px;color:#505050;cursor:pointer;transition:color .15s,border-color .15s;}
+.shr-close-btn:hover{color:#FFFFFF;border-color:#3A3A3A;}
+@keyframes shr-slide-up{from{transform:translateY(100%);}to{transform:translateY(0);}}
+@keyframes shr-fade-in{from{opacity:0;}to{opacity:1;}}
 </style>
 """, unsafe_allow_html=True)
 
@@ -1256,6 +1529,17 @@ def render():
                         if st.button("🚀 Unlock Full AI Insights →",key="ai_blur_cta",type="primary",use_container_width=True): st.session_state.current_page="settings"; st.rerun()
                 else:
                     st.markdown(f'<div class="ai-msg-bot">{c}</div>', unsafe_allow_html=True)
+                    # ── Share button — only for decision-type responses ────────
+                    _raw_answer = msg["content"]
+                    _rec_lbl, _ = _extract_recommendation(_raw_answer)
+                    if _rec_lbl:
+                        _share_ticker = st.session_state.get("last_ticker_asked", "")
+                        _render_ai_share_sheet(
+                            question  = st.session_state.mai_history[_mi - 1]["content"] if _mi > 0 else "",
+                            answer    = _raw_answer,
+                            ticker    = _share_ticker,
+                            sheet_key = f"ai-share-{_mi}",
+                        )
 
                 # Pro-exclusive badge on advanced outputs
                 if is_pro:
@@ -1725,7 +2009,7 @@ def render():
             ("How do I upgrade from the free plan?",
              "Go to Settings (or tap 'Start Free Trial' anywhere on the app). Plans start from ₦3,500/month for Starter. All paid plans include a 14-day free trial so you can test full access before committing. Billing is monthly and you can cancel at any time."),
             ("Does NGX Signal work on mobile?",
-             "Yes — NGX Signal is fully optimised for mobile browsers. Open ngx-signal.streamlit.app in your mobile browser (Chrome, Samsung Internet, Safari) and bookmark it for easy daily access. A dedicated app is on our roadmap."),
+             "Yes — NGX Signal is fully optimised for mobile browsers. Open ngxsignal.com in your mobile browser (Chrome, Samsung Internet, Safari) and bookmark it for easy daily access. A dedicated app is on our roadmap."),
             ("What is the NGX Trade Game?",
              "The Trade Game is a paper trading simulator. You receive virtual Naira (from ₦500k on the free plan up to ₦10M on Pro) and can buy and sell real NGX stocks without using real money. It's the safest way to practice your strategy and build confidence before trading with real funds."),
         ]
@@ -1768,4 +2052,3 @@ def render():
 
     if tier in ("visitor","free"):
         st.markdown("<div style='height:80px'></div>", unsafe_allow_html=True)
-
