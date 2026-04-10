@@ -17,6 +17,7 @@ import requests
 import hashlib
 from datetime import date, datetime, timedelta
 from app.utils.supabase_client import get_supabase
+from app.views.signals import generate_trending_sentiment_tag
 
 try:
     import pytz
@@ -898,8 +899,9 @@ def render():
 .notif-banner{display:flex;align-items:center;gap:10px;background:linear-gradient(90deg,#0A0500,#100800);border:1px solid rgba(240,165,0,.3);border-left:3px solid #F0A500;border-radius:10px;padding:11px 16px;margin-bottom:10px;font-family:'DM Mono',monospace;font-size:12px;animation:notif-slide .4s ease both;}
 .notif-banner-red{background:linear-gradient(90deg,#0A0000,#100000)!important;border-color:rgba(239,68,68,.35)!important;border-left-color:#EF4444!important;}
 .notif-banner-green{background:linear-gradient(90deg,#000A00,#001000)!important;border-color:rgba(34,197,94,.3)!important;border-left-color:#22C55E!important;}
-.trending-row{display:flex;align-items:center;gap:10px;background:#0A0A0A;border:1px solid #1F1F1F;border-radius:10px;padding:10px 14px;margin-bottom:7px;font-family:'DM Mono',monospace;animation:flash-in .3s ease both;transition:border-color .2s;}
+.trending-row{display:flex;flex-direction:column;gap:4px;background:#0A0A0A;border:1px solid #1F1F1F;border-radius:10px;padding:10px 14px;margin-bottom:7px;font-family:'DM Mono',monospace;animation:flash-in .3s ease both;transition:border-color .2s;}
 .trending-row:hover{border-color:rgba(240,165,0,.2);}
+.trending-row-top{display:flex;align-items:center;gap:10px;}
 .trend-sym{font-family:'Space Grotesk',sans-serif;font-size:14px;font-weight:700;color:#FFFFFF;min-width:90px;}
 .trend-chg{font-size:13px;font-weight:600;min-width:62px;}
 .trend-tag{font-size:10px;font-weight:700;padding:2px 9px;border-radius:999px;text-transform:uppercase;letter-spacing:.05em;}
@@ -994,16 +996,61 @@ def render():
 
     # ── TRENDING NOW ──────────────────────────────────────────────────────────
     if uniq:
+        # Fetch signal scores for trending stocks so we can pass them to sentiment engine
+        _sig_res = sb.table("signal_scores").select("symbol,signal,stars,momentum_score,volume_score,news_score").order("score_date", desc=True).limit(200).execute()
+        _sig_map: dict = {}
+        for _sr in (_sig_res.data or []):
+            _s = _sr.get("symbol", "")
+            if _s and _s not in _sig_map:
+                _sig_map[_s] = _sr
+
         _ts_all = (sorted([p for p in uniq if float(p.get("change_percent") or 0)>0], key=lambda x:float(x.get("change_percent",0) or 0), reverse=True)[:3]
                  + sorted([p for p in uniq if float(p.get("change_percent") or 0)<0], key=lambda x:float(x.get("change_percent",0) or 0))[:2])[:5]
         if _ts_all:
             st.markdown('<div class="sec-title">🔥 Trending Now</div>', unsafe_allow_html=True)
             _th = ""
             for _ti,_ts in enumerate(_ts_all):
-                _tc=float(_ts.get("change_percent",0) or 0); _tag,_tc2,_arr=_trend_tag(_tc)
-                _cc="#22C55E" if _tc>=0 else "#EF4444"; _dc="live-dot-green" if _tc>=0 else "live-dot-red"
-                _tm=_time_ago((_ti*23+_notif_minutes)%118+2)
-                _th += f'<div class="trending-row"><div class="live-dot {_dc}"></div><span class="trend-sym">{_ts["symbol"]}</span><span class="trend-chg" style="color:{_cc};">{_arr} {abs(_tc):.2f}%</span><span class="trend-tag" style="background:{_tc2}18;color:{_tc2};">{_tag}</span><span class="trend-time">Updated {_tm}</span></div>'
+                _tc  = float(_ts.get("change_percent",0) or 0)
+                _tag, _tc2, _arr = _trend_tag(_tc)
+                _cc  = "#22C55E" if _tc>=0 else "#EF4444"
+                _dc  = "live-dot-green" if _tc>=0 else "live-dot-red"
+                _tm  = _time_ago((_ti*23+_notif_minutes)%118+2)
+                _sym = _ts["symbol"]
+
+                # ── Gather signal data for sentiment engine ───────────────────
+                _sd       = _sig_map.get(_sym, {})
+                _sig_code = (_sd.get("signal") or "HOLD").upper().replace(" ", "_")
+                _stars    = int(_sd.get("stars", 3) or 3)
+                _mom      = float(_sd.get("momentum_score", 0.4) or 0.4)
+                _vols     = float(_sd.get("volume_score", 0.4) or 0.4)
+                _comp     = float(_sd.get("news_score", 0.4) or 0.4)
+                _vol_raw  = int(_ts.get("volume", 0) or 0)
+
+                # ── Build sentiment tag HTML ──────────────────────────────────
+                _sent_tag = generate_trending_sentiment_tag(
+                    symbol     = _sym,
+                    signal_code= _sig_code,
+                    chg        = _tc,
+                    volume     = _vol_raw,
+                    momentum   = _mom,
+                    vol_score  = _vols,
+                    composite  = _comp,
+                    stars      = _stars,
+                )
+
+                # ── Build row: top line (symbol / change / tag / time) + sentiment below ──
+                _th += (
+                    f'<div class="trending-row" style="border-left:3px solid {_tc2}33;">'
+                    f'<div class="trending-row-top">'
+                    f'<div class="live-dot {_dc}"></div>'
+                    f'<span class="trend-sym">{_sym}</span>'
+                    f'<span class="trend-chg" style="color:{_cc};">{_arr} {abs(_tc):.2f}%</span>'
+                    f'<span class="trend-tag" style="background:{_tc2}18;color:{_tc2};">{_tag}</span>'
+                    f'<span class="trend-time">Updated {_tm}</span>'
+                    f'</div>'
+                    f'{_sent_tag}'
+                    f'</div>'
+                )
             st.markdown(_th, unsafe_allow_html=True)
 
             # Today's Opportunities — gated by tier
