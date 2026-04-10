@@ -202,64 +202,134 @@ body{{background:transparent;font-family:'DM Mono',monospace;color:#fff;overflow
 </body></html>
 """, height=145, scrolling=False)
 
-        # ── TradingView Advanced Chart Widget ─────────
-        # Uses the embed-widget-advanced-chart script (more reliable than tv.js)
-        # Symbol format: NSENG:SYMBOL for Nigerian Exchange
-        tv_config = (
-            '{"autosize":true'
-            f',"symbol":"{tv_symbol}"'
-            ',"interval":"D"'
-            ',"timezone":"Africa/Lagos"'
-            ',"theme":"dark"'
-            ',"style":"1"'
-            ',"locale":"en"'
-            ',"backgroundColor":"#000000"'
-            ',"gridColor":"rgba(17,17,17,0.9)"'
-            ',"hide_top_toolbar":false'
-            ',"hide_legend":false'
-            ',"save_image":false'
-            ',"hide_volume":false'
-            ',"support_host":"https://www.tradingview.com"'
-            ',"overrides":{'
-            '"paneProperties.background":"#000000"'
-            ',"paneProperties.backgroundType":"solid"'
-            ',"paneProperties.vertGridProperties.color":"#111111"'
-            ',"paneProperties.horzGridProperties.color":"#111111"'
-            ',"scalesProperties.textColor":"#808080"'
-            ',"mainSeriesProperties.candleStyle.upColor":"#22C55E"'
-            ',"mainSeriesProperties.candleStyle.downColor":"#EF4444"'
-            ',"mainSeriesProperties.candleStyle.borderUpColor":"#22C55E"'
-            ',"mainSeriesProperties.candleStyle.borderDownColor":"#EF4444"'
-            ',"mainSeriesProperties.candleStyle.wickUpColor":"#22C55E"'
-            ',"mainSeriesProperties.candleStyle.wickDownColor":"#EF4444"'
-            '}}'
-        )
+        # ── TradingView Advanced Chart Widget ─────────────────────────────
+        # style:"3" = Area chart (line + fill) — matches image 1
+        # style:"1" = Candlestick (avoid — that's image 2, wrong)
+        # interval:"D" = Daily bars — most current data for NGX
+        # range:"3M"  = Show 3 months of data so chart isn't stale-looking
+        # hide_top_toolbar:false lets user switch timeframe manually
+        # Script loaded synchronously (not async) for faster first paint
+        # Loading overlay hides the blank iframe flash on slow connections
 
-        st.components.v1.html(f"""
-<!DOCTYPE html><html>
+        tv_html = f"""<!DOCTYPE html><html>
 <head>
+<meta name="viewport" content="width=device-width,initial-scale=1">
 <style>
 *{{margin:0;padding:0;box-sizing:border-box;}}
-body{{background:#000;overflow:hidden;}}
-.tv-wrap{{background:#000;border:1px solid #1F1F1F;border-radius:10px;
-          overflow:hidden;height:420px;position:relative;}}
+html,body{{height:100%;background:#000;overflow:hidden;}}
+.tv-outer{{
+  position:relative;height:420px;
+  background:#000;border:1px solid #1F1F1F;border-radius:10px;overflow:hidden;
+}}
+/* Loading shimmer shown until TradingView widget fires */
+.tv-loader{{
+  position:absolute;inset:0;z-index:10;
+  background:#000;display:flex;flex-direction:column;
+  align-items:center;justify-content:center;gap:10px;
+  font-family:'DM Mono',monospace;font-size:11px;color:#4B5563;
+  transition:opacity .4s ease;
+}}
+.tv-loader-bar{{
+  width:120px;height:3px;background:#1F1F1F;border-radius:2px;overflow:hidden;
+}}
+.tv-loader-fill{{
+  height:100%;width:0%;background:#F0A500;border-radius:2px;
+  animation:tv-load 2.5s ease-in-out infinite;
+}}
+@keyframes tv-load{{0%{{width:0%}}60%{{width:85%}}100%{{width:100%}}}}
 .tradingview-widget-container{{height:100%;width:100%;}}
-.tradingview-widget-container__widget{{height:100%;width:100%;}}
+.tradingview-widget-container__widget{{height:calc(100% - 32px);width:100%;}}
+.tradingview-widget-copyright{{font-size:10px;}}
 </style>
 </head>
 <body>
-<div class="tv-wrap">
-  <div class="tradingview-widget-container">
+<div class="tv-outer" id="tvOuter">
+  <!-- Loading overlay — hidden once widget fires -->
+  <div class="tv-loader" id="tvLoader">
+    <div style="font-size:13px;color:#808080;">📈 Loading chart…</div>
+    <div class="tv-loader-bar"><div class="tv-loader-fill"></div></div>
+    <div style="font-size:10px;color:#374151;">NSENG:{symbol}</div>
+  </div>
+
+  <!-- TradingView Advanced Chart -->
+  <div class="tradingview-widget-container" id="tvContainer">
     <div class="tradingview-widget-container__widget"></div>
-    <script type="text/javascript"
-      src="https://s3.tradingview.com/external-embedding/embed-widget-advanced-chart.js"
-      async>
-    {tv_config}
-    </script>
+    <div class="tradingview-widget-copyright">
+      <a href="https://www.tradingview.com/" rel="noopener nofollow" target="_blank">
+        <span class="blue-text" style="font-size:10px;color:#374151;">TradingView</span>
+      </a>
+    </div>
   </div>
 </div>
-</body></html>
-""", height=440, scrolling=False)
+
+<script>
+// Hide loader once TradingView widget has painted
+function hideLoader() {{
+  var el = document.getElementById('tvLoader');
+  if (el) {{ el.style.opacity = '0'; setTimeout(function(){{el.style.display='none';}}, 450); }}
+}}
+
+// Widget config — style 3 = Area chart (line + fill under it)
+var tvConfig = {{
+  "autosize": true,
+  "symbol": "NSENG:{symbol}",
+  "interval": "D",
+  "range": "3M",
+  "timezone": "Africa/Lagos",
+  "theme": "dark",
+  "style": "3",
+  "locale": "en",
+  "backgroundColor": "#000000",
+  "gridColor": "rgba(17,17,17,0.9)",
+  "hide_top_toolbar": false,
+  "hide_legend": false,
+  "save_image": false,
+  "hide_volume": false,
+  "support_host": "https://www.tradingview.com",
+  "overrides": {{
+    "paneProperties.background": "#000000",
+    "paneProperties.backgroundType": "solid",
+    "paneProperties.vertGridProperties.color": "#111111",
+    "paneProperties.horzGridProperties.color": "#111111",
+    "scalesProperties.textColor": "#808080",
+    "mainSeriesProperties.areaStyle.color1": "{color}",
+    "mainSeriesProperties.areaStyle.color2": "rgba(0,0,0,0)",
+    "mainSeriesProperties.areaStyle.linecolor": "{color}",
+    "mainSeriesProperties.areaStyle.linewidth": 2,
+    "mainSeriesProperties.areaStyle.priceSource": "close",
+    "mainSeriesProperties.lineStyle.color": "{color}",
+    "mainSeriesProperties.lineStyle.linewidth": 2
+  }}
+}};
+
+// Load the script — synchronous so no async blank-page flash
+(function() {{
+  var s = document.createElement('script');
+  s.type = 'text/javascript';
+  s.src = 'https://s3.tradingview.com/external-embedding/embed-widget-advanced-chart.js';
+  s.onload = function() {{ setTimeout(hideLoader, 1800); }};
+  // Also hide loader on MutationObserver — catches widget render
+  var observer = new MutationObserver(function(muts) {{
+    for (var m of muts) {{
+      if (m.addedNodes.length) {{ setTimeout(hideLoader, 600); observer.disconnect(); break; }}
+    }}
+  }});
+  observer.observe(document.querySelector('.tradingview-widget-container__widget'), {{childList: true, subtree: true}});
+  // Inject config as the script's text content
+  s.text = JSON.stringify(tvConfig);
+  document.querySelector('.tradingview-widget-container').appendChild(s);
+}})();
+
+// Resize iframe to content
+function resize() {{
+  var h = document.body.scrollHeight + 16;
+  window.parent.postMessage({{type:'streamlit:setFrameHeight', height: 440}}, '*');
+}}
+window.addEventListener('load', resize);
+</script>
+</body></html>"""
+
+        st.components.v1.html(tv_html, height=440, scrolling=False)
 
         # ── Analysis text ──────────────────────────────
         st.components.v1.html(f"""
