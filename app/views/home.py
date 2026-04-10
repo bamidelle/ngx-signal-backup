@@ -622,6 +622,127 @@ def _render_downgrade_modal(name: str, stats: dict):
         st.session_state.current_page = "settings"; st.rerun()
 
 # ══════════════════════════════════════════════════════════════════════════════
+# PERSONALIZED CONTEXT STRIP
+# ══════════════════════════════════════════════════════════════════════════════
+
+def render_personalized_strip(tier: str, profile: dict, sb, name: str, uniq: list):
+    """
+    Slim one-line personalized context bar placed between the greeting and the
+    notification banner. Feels like the app "knows" the user. Pure st.markdown —
+    no widgets inside the strip HTML itself.
+    """
+    if tier == "visitor":
+        return  # Nothing for visitors
+
+    # ── Shared helpers ────────────────────────────────────────────────────────
+    last_ticker   = st.session_state.get("last_ticker_asked", "")
+    ticker_data   = next((p for p in uniq if p.get("symbol","").upper() == last_ticker.upper()), None) if last_ticker else None
+    chg           = float(ticker_data.get("change_percent", 0)) if ticker_data else None
+    chg_str       = (f"+{chg:.2f}% ▲" if chg >= 0 else f"{chg:.2f}% ▼") if chg is not None else None
+    chg_color     = ("#22C55E" if chg >= 0 else "#EF4444") if chg is not None else "#F0A500"
+
+    last_date     = st.session_state.get("last_query_date")
+    days_ago      = (date.today() - last_date).days if isinstance(last_date, date) else None
+    days_ago_str  = (f"{days_ago} day{'s' if days_ago != 1 else ''} ago") if days_ago is not None else "recently"
+
+    used_today    = get_ai_query_count()
+    streak        = get_streak()
+    streak_html   = f'🔥 {streak} days' if streak >= 2 else '—'
+
+    GOLD  = "#F0A500"
+    WHITE = "#FFFFFF"
+    MUTE  = "#C0C0C0"
+    DIM   = "#808080"
+
+    def _strip(inner_html: str, show_upgrade_btn: bool = False, upgrade_key: str = ""):
+        """Render the strip card + optional upgrade button."""
+        st.markdown(f"""
+<div style="background:#080808;border:1px solid #1F1F1F;border-left:3px solid {GOLD};
+            border-radius:10px;padding:11px 16px;margin-bottom:12px;
+            font-family:'DM Mono',monospace;font-size:12px;color:{MUTE};
+            display:flex;align-items:center;justify-content:space-between;gap:10px;">
+  <span style="line-height:1.5;">{inner_html}</span>
+  {"<span style='font-size:10px;color:#404040;white-space:nowrap;'>Upgrade ↗</span>" if show_upgrade_btn else ""}
+</div>""", unsafe_allow_html=True)
+        if show_upgrade_btn and upgrade_key:
+            # Invisible-width button — the "Upgrade ↗" text in the div is the visual label;
+            # this button sits just below and triggers navigation on click.
+            if st.button("Upgrade ↗", key=upgrade_key, use_container_width=False):
+                st.session_state.current_page = "settings"
+                st.rerun()
+
+    def _gold(text):  return f'<span style="color:{GOLD};font-weight:600;">{text}</span>'
+    def _white(text): return f'<span style="color:{WHITE};font-weight:600;">{text}</span>'
+    def _col(text, color): return f'<span style="color:{color};font-weight:600;">{text}</span>'
+
+    # ── FREE ─────────────────────────────────────────────────────────────────
+    if tier == "free":
+        limit = get_usage_limit("ai_queries", "free") or 2
+        if used_today == 0:
+            inner = f"👋 Welcome back, {_gold(name)}. You have {_white(str(limit))} free AI queries today — ask your first question below."
+            _strip(inner)
+        else:
+            rem = max(0, limit - used_today)
+            if rem == 0:
+                inner = f"⚡ You've used {_white(str(used_today))} of {_white(str(limit))} free queries today. Upgrade for unlimited AI access."
+                _strip(inner, show_upgrade_btn=True, upgrade_key="strip_free_upgrade")
+            else:
+                inner = f"⚡ You've used {_white(str(used_today))} of {_white(str(limit))} free queries today — {_gold(str(rem))} remaining."
+                _strip(inner)
+
+    # ── TRIAL ────────────────────────────────────────────────────────────────
+    elif tier == "trial":
+        trial_day = get_trial_day_number(profile)
+        if last_ticker and ticker_data and chg is not None:
+            inner = (f"📡 {_gold(name)}, {_gold(last_ticker)} is "
+                     f"{_col(chg_str, chg_color)} today"
+                     + (f" — you asked about it {_white(days_ago_str)}" if days_ago is not None else "") + ".")
+        else:
+            inner = (f"✨ Trial Day {_gold(str(trial_day))} of 14 — "
+                     f"{_white(str(used_today))} AI {'query' if used_today == 1 else 'queries'} used. "
+                     f"Your edge is live. Ask anything below.")
+        _strip(inner)
+
+    # ── STARTER ──────────────────────────────────────────────────────────────
+    elif tier == "starter":
+        limit = 15
+        rem   = max(0, limit - used_today)
+        if last_ticker and ticker_data and chg is not None:
+            inner = (f"📊 {_gold(last_ticker)} update: {_col(chg_str, chg_color)} today"
+                     f" · {_white(str(used_today))} of {_white(str(limit))} queries used"
+                     f" · Streak: {_white(streak_html)}")
+            show_up = (rem == 0)
+            _strip(inner, show_upgrade_btn=show_up, upgrade_key="strip_starter_upgrade" if show_up else "")
+        else:
+            inner = (f"📊 {_gold(name)}"
+                     f" · {_white(str(used_today))} of {_white(str(limit))} queries used today"
+                     f" · Streak: {_white(streak_html)}")
+            show_up = (rem == 0)
+            _strip(inner, show_upgrade_btn=show_up, upgrade_key="strip_starter_upgrade2" if show_up else "")
+
+    # ── TRADER ───────────────────────────────────────────────────────────────
+    elif tier == "trader":
+        if last_ticker and ticker_data and chg is not None:
+            inner = (f"📡 {_gold(last_ticker)} is {_col(chg_str, chg_color)} today"
+                     f" · Unlimited queries · Streak: {_white(streak_html)} · Pidgin mode available")
+        else:
+            inner = (f"✨ {_gold(name)}"
+                     f" · Unlimited queries · Streak: {_white(streak_html)}"
+                     f" · Full NGX intelligence unlocked")
+        _strip(inner)
+
+    # ── PRO ──────────────────────────────────────────────────────────────────
+    elif tier == "pro":
+        if last_ticker and ticker_data and chg is not None:
+            inner = (f"🏆 {_gold('PRO')} · {_gold(last_ticker)}: {_col(chg_str, chg_color)} today"
+                     f" · Unlimited AI · PDF exports ready · Advanced outputs on")
+        else:
+            inner = (f"🏆 {_gold('PRO')} · {_gold(name)}"
+                     f" · Unlimited AI · PDF exports · Advanced outputs · Full intelligence active")
+        _strip(inner)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # MAIN RENDER
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -856,6 +977,9 @@ def render():
   {now.strftime("%A, %d %B %Y")} · {now.strftime("%I:%M %p")} WAT
 </div>""", unsafe_allow_html=True)
 
+    # ── PERSONALIZED CONTEXT STRIP ───────────────────────────────────────────
+    render_personalized_strip(tier, profile, sb, name, uniq)
+
     # ── NOTIFICATION BANNER ───────────────────────────────────────────────────
     _notif_minutes = (now.hour * 60 + now.minute) % 137 + 3
     if top_g:
@@ -1054,18 +1178,6 @@ def render():
 
         st.markdown("</div>", unsafe_allow_html=True)
 
-        # ── Chips ─────────────────────────────────────────────────────────────
-        CHIPS=["What stock should I buy today?",
-               f"Why is {top_g[0]['symbol'] if top_g else 'MTNN'} moving?",
-               "Explain the current market mood.",
-               "Compare the top 3 gainers.",
-               "Which sector should I watch?"]
-        chip_cols=st.columns(len(CHIPS))
-        for ci,chip in enumerate(CHIPS):
-            with chip_cols[ci]:
-                if st.button(chip,key=f"chip_{ci}",use_container_width=True):
-                    st.session_state.mai_pending=chip; st.rerun()
-
         # ── Chat history ──────────────────────────────────────────────────────
         for _mi,msg in enumerate(st.session_state.mai_history[-8:]):
             if msg["role"]=="user":
@@ -1131,20 +1243,80 @@ def render():
             _r=max(0,15-get_ai_query_count())
             st.caption(f"Starter plan: {_r}/15 queries remaining today. Upgrade to Trader for unlimited.")
 
-        # ── Auto-suggestions (empty chat, non-visitor) ───────────────────────
+        # ── Smart Suggested Questions (empty chat, non-visitor) ─────────────────
         if not st.session_state.mai_history and ai_allowed and tier not in ("visitor",):
-            _top_sym=top_g[0]["symbol"] if top_g else "MTNN"
-            _aqs=["What should I buy today?",f"Is {_top_sym} undervalued?","Which sector is strongest?","Top 3 stocks this week"]
-            st.markdown('<div style="font-family:DM Mono,monospace;font-size:10px;color:#505050;margin:6px 0 4px 0;">💡 Try asking:</div>', unsafe_allow_html=True)
-            _aqc=st.columns(4)
-            for _ai2,_aq in enumerate(_aqs):
+            _top_sym = top_g[0]["symbol"] if top_g else "MTNN"
+            _top2    = top_g[1]["symbol"] if len(top_g) > 1 else "ZENITHBANK"
+            _last_t  = st.session_state.get("last_ticker_asked", "")
+
+            # Build tier-aware questions — real questions that produce real AI answers
+            if tier == "free":
+                _aqs = [
+                    f"Should I buy {_top_sym} today?",
+                    "What stock should I buy this week?",
+                    "Is the NGX market bullish right now?",
+                    "Which is safer: {0} or {1}?".format(_top_sym, _top2),
+                ]
+            elif tier == "trial":
+                _aqs = [
+                    f"Give me a full analysis of {_top_sym}",
+                    f"What's the best entry price for {_top2}?",
+                    "Which sector is showing the strongest momentum today?",
+                    f"Compare {_top_sym} and {_top2} — which should I buy?",
+                ] if not _last_t else [
+                    f"Give me a full analysis of {_last_t}",
+                    f"What's the risk level for {_last_t} right now?",
+                    f"Should I buy {_top_sym} today?",
+                    "Which sector is strongest today?",
+                ]
+            elif tier == "starter":
+                _aqs = [
+                    f"Is {_top_sym} a good buy at current price?",
+                    f"What is the stop-loss level for {_top2}?",
+                    "Top 3 NGX stocks to watch this week",
+                    f"Explain the volume signal on {_top_sym}",
+                ] if not _last_t else [
+                    f"Update me on {_last_t} — buy, hold, or avoid?",
+                    f"What's the entry range for {_last_t}?",
+                    f"Is {_top_sym} better than {_top2} right now?",
+                    "Top 3 NGX stocks to watch this week",
+                ]
+            elif tier == "trader":
+                _aqs = [
+                    f"Give me a trader-level breakdown of {_top_sym}",
+                    f"What's the momentum signal on {_top2}?",
+                    "Which NGX sector has the strongest rotation today?",
+                    f"Risk-adjusted entry strategy for {_top_sym}",
+                ]
+            else:  # pro
+                _aqs = [
+                    f"Build me a portfolio strategy around {_top_sym}",
+                    f"What are the top 3 buy opportunities on NGX today?",
+                    f"Advanced analysis of {_top_sym}: entry, target, stop-loss",
+                    "Sector rotation signal — where is smart money moving?",
+                ]
+
+            st.markdown('<div style="font-family:DM Mono,monospace;font-size:10px;color:#505050;margin:8px 0 6px 0;">💡 Tap a question to get an instant AI answer:</div>', unsafe_allow_html=True)
+            _aqc = st.columns(len(_aqs))
+            for _ai2, _aq in enumerate(_aqs):
                 with _aqc[_ai2]:
-                    if st.button(_aq,key=f"aq_{_ai2}",use_container_width=True): st.session_state.mai_pending=_aq; st.rerun()
+                    if st.button(_aq, key=f"aq_{_ai2}", use_container_width=True):
+                        st.session_state.mai_pending = _aq
+                        st.rerun()
 
         # ── Handle send ───────────────────────────────────────────────────────
         question=(user_q or "").strip()
         if send and question and ai_allowed:
             increment_ai_query_count(); update_streak()
+            # ── Track last query for personalized strip ───────────────────────
+            # Extract ticker from question (uppercase 3-8 char word matching a known symbol)
+            _known_syms = {p.get("symbol","").upper() for p in uniq}
+            _words = re.findall(r'\b[A-Z]{2,8}\b', question.upper())
+            _found_ticker = next((w for w in _words if w in _known_syms), "")
+            if _found_ticker:
+                st.session_state.last_ticker_asked = _found_ticker
+            st.session_state.last_query_date = date.today()
+            # ─────────────────────────────────────────────────────────────────
             prompt_tuple = _build_ai_system_prompt(
                 tier, ad, aarr, acg, mood, gc, lc, total,
                 top_g_text, latest_date, market["is_open"],
