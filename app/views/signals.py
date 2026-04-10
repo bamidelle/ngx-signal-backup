@@ -221,232 +221,289 @@ def generate_signal_narrative(
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# MARKET SENTIMENT INTELLIGENCE ENGINE
-# Combines news, social, and market behavior into plain-English context.
-# All output is deterministic — derived from existing signal_scores +
-# stock_prices data. No external API required.
-# Cache refreshes every 10 minutes to avoid re-computation on every load.
+# MARKET SENTIMENT INTELLIGENCE ENGINE v2
+# ─────────────────────────────────────────────────────────────────────────────
+# Layer 1 — Real news:  Google News RSS fetch per stock (free, no key needed)
+# Layer 2 — AI brain:   Groq (Llama 3.1) → Gemini fallback interprets headlines
+# Layer 3 — Fallback:   Number-based logic if news fetch or AI both fail
+#
+# Cache TTL: 30 minutes per stock — safe for Streamlit Cloud rate limits
+# Max headlines passed to AI: 5 (keeps tokens low, cost = ~$0)
 # ══════════════════════════════════════════════════════════════════════════════
 
 import hashlib
+import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta
 
+
+# ── Cache helpers ─────────────────────────────────────────────────────────────
 
 def _sentiment_cache_key(symbol: str) -> str:
     return f"_mri_{symbol}"
 
-
-def _cache_is_fresh(symbol: str, ttl_minutes: int = 10) -> bool:
-    key   = f"_mri_ts_{symbol}"
-    stamp = st.session_state.get(key)
+def _cache_is_fresh(symbol: str, ttl_minutes: int = 30) -> bool:
+    stamp = st.session_state.get(f"_mri_ts_{symbol}")
     if not stamp:
         return False
     return (datetime.utcnow() - stamp) < timedelta(minutes=ttl_minutes)
-
 
 def _set_cache(symbol: str, data: dict):
     st.session_state[_sentiment_cache_key(symbol)] = data
     st.session_state[f"_mri_ts_{symbol}"]          = datetime.utcnow()
 
-
 def _get_cache(symbol: str) -> dict | None:
     return st.session_state.get(_sentiment_cache_key(symbol))
 
 
-# ── Core intelligence function ────────────────────────────────────────────────
+# ── Layer 1: Google News RSS fetch ────────────────────────────────────────────
 
-def generate_market_reality_block(
-    symbol:    str,
-    signal_code: str,
-    chg:       float,   # today's % price change
-    volume:    int,     # today's volume
-    momentum:  float,   # 0–1
-    vol_score: float,   # 0–1
-    composite: float,   # 0–1  (the "news_score" field — proxies sentiment)
-    stars:     int,
-) -> dict:
-    """
-    Returns a dict with keys:
-      situation   : str   — one of CONFIRMED_MOVE, HYPE, QUIET_OPPORTUNITY, CONFLICT
-      line1       : str   — what people / news are saying
-      line2       : str   — what the system sees in market behavior
-      verdict     : str   — short human-like conclusion
-      tag_line1   : str   — short version for Trending Now (line 1)
-      tag_arrow   : str   — short version for Trending Now (→ conclusion)
-      color       : str   — accent hex for the UI
-    """
+_TICKER_NAME_MAP = {
+    "ZENITHBANK": "Zenith Bank Nigeria",
+    "GTCO": "Guaranty Trust GTCO Nigeria",
+    "ACCESSCORP": "Access Holdings Nigeria",
+    "FBNH": "First Bank Nigeria FBN Holdings",
+    "UBA": "United Bank Africa Nigeria",
+    "MTNN": "MTN Nigeria",
+    "AIRTELAFRI": "Airtel Africa Nigeria",
+    "DANGCEM": "Dangote Cement Nigeria",
+    "BUACEMENT": "BUA Cement Nigeria",
+    "NESTLE": "Nestle Nigeria",
+    "SEPLAT": "Seplat Energy Nigeria",
+    "STANBIC": "Stanbic IBTC Nigeria",
+    "WAPCO": "Lafarge Africa Nigeria",
+    "NB": "Nigerian Breweries Nigeria",
+    "CADBURY": "Cadbury Nigeria",
+    "FLOURMILL": "Flour Mills Nigeria",
+    "TRANSCORP": "Transcorp Nigeria",
+    "FIDELITYBK": "Fidelity Bank Nigeria",
+    "STERLING": "Sterling Bank Nigeria",
+    "JAIZBANK": "Jaiz Bank Nigeria",
+    "OKOMUOIL": "Okomu Oil Nigeria",
+    "PRESCO": "Presco Nigeria",
+    "TOTAL": "TotalEnergies Nigeria",
+    "CONOIL": "Conoil Nigeria",
+    "CHAMPION": "Champion Breweries Nigeria",
+    "DANGSUGAR": "Dangote Sugar Nigeria",
+    "UNILEVER": "Unilever Nigeria",
+    "GUINNESS": "Guinness Nigeria",
+    "INTBREW": "International Breweries Nigeria",
+    "BETAGLASS": "Beta Glass Nigeria",
+    "LAFARGE": "Lafarge Africa Nigeria",
+    "GEREGU": "Geregu Power Nigeria",
+    "TRANSPOWER": "Transmission Company Nigeria",
+    "FBNH": "FBN Holdings Nigeria First Bank",
+    "WEMA": "Wema Bank Nigeria",
+    "FCMB": "FCMB Group Nigeria First City Monument",
+    "ETI": "Ecobank Transnational Nigeria ETI",
+    "UNIONBANK": "Union Bank Nigeria",
+    "ABBEYMORT": "Abbey Mortgage Bank Nigeria",
+    "HONYFLOUR": "Honeywell Flour Mills Nigeria",
+    "ROYALEX": "Royal Exchange Nigeria",
+    "AIICO": "AIICO Insurance Nigeria",
+    "NEM": "NEM Insurance Nigeria",
+    "VITAFOAM": "Vitafoam Nigeria",
+    "CUTIX": "Cutix Nigeria cable",
+    "ELLAHLAKES": "Ellah Lakes Nigeria",
+    "LINKASSURE": "Linkage Assurance Nigeria",
+}
 
-    # ── Return cached result if still fresh ──────────────────────────────────
+def _company_search_term(symbol: str) -> str:
+    return _TICKER_NAME_MAP.get(symbol.upper(), f"{symbol} Nigeria stock NGX")
+
+def fetch_stock_news(symbol: str, max_items: int = 5) -> list:
+    """
+    Fetch recent headlines from Google News RSS (free, no API key).
+    Returns list of {title, source, age_hours} dicts. Returns [] on failure.
+    """
+    import requests as _req
+    search_term = _company_search_term(symbol)
+    query = search_term.replace(" ", "+")
+    url   = f"https://news.google.com/rss/search?q={query}&hl=en-NG&gl=NG&ceid=NG:en"
+    try:
+        r = _req.get(url, timeout=8, headers={"User-Agent": "Mozilla/5.0"})
+        if r.status_code != 200:
+            return []
+        root  = ET.fromstring(r.text)
+        items = root.findall(".//item")
+        news  = []
+        now   = datetime.utcnow()
+        for item in items[:max_items]:
+            title    = (item.findtext("title")   or "").strip()
+            pub_date = (item.findtext("pubDate") or "").strip()
+            source   = (item.findtext("source")  or "").strip()
+            age_hours = 48
+            if pub_date:
+                for fmt in ["%a, %d %b %Y %H:%M:%S %Z", "%a, %d %b %Y %H:%M:%S %z"]:
+                    try:
+                        pub_dt    = datetime.strptime(pub_date, fmt).replace(tzinfo=None)
+                        age_hours = max(0, int((now - pub_dt).total_seconds() / 3600))
+                        break
+                    except ValueError:
+                        continue
+            if title and age_hours <= 168:
+                news.append({"title": title, "source": source, "age_hours": age_hours})
+        return news
+    except Exception:
+        return []
+
+
+# ── Layer 2: AI interprets headlines ─────────────────────────────────────────
+
+def _build_sentiment_prompt(symbol, headlines, signal_code, chg, volume, momentum, vol_score):
+    is_gain   = chg >= 0
+    direction = f"UP {chg:+.2f}%" if is_gain else f"DOWN {chg:+.2f}%"
+    m_pct     = int(min(momentum,  1.0) * 100)
+    v_pct     = int(min(vol_score, 1.0) * 100)
+    vol_str   = f"{volume:,}" if volume > 0 else "unknown"
+    sig_lbl   = signal_code.replace("_", " ")
+    headlines_text = "\n".join(
+        f"- [{h['age_hours']}h ago | {h['source']}] {h['title']}"
+        for h in headlines
+    ) if headlines else "No recent headlines found."
+
+    return f"""You are a Nigerian stock market intelligence assistant for NGX Signal.
+
+A user is looking at {symbol} on the NGX. Here is the data:
+
+MARKET DATA:
+- Signal: {sig_lbl}
+- Price change today: {direction}
+- Momentum score: {m_pct}%
+- Volume score: {v_pct}% (volume today: {vol_str} shares)
+
+RECENT NEWS HEADLINES (last 7 days):
+{headlines_text}
+
+YOUR JOB:
+Read the headlines and market data, then write a "What's Really Driving This" explanation.
+Use ONLY simple everyday English. No jargon. Write like explaining to a friend.
+
+Respond ONLY with a JSON object — no markdown, no extra text:
+{{"situation":"CONFIRMED_MOVE"|"HYPE"|"QUIET_OPPORTUNITY"|"CONFLICT"|"NO_DATA","line1":"One sentence about what news or public attention is saying — be specific about actual events if headlines exist","line2":"One sentence about what the actual market behavior shows","verdict":"One short human conclusion — max 18 words","tag_line1":"Very short (max 8 words) — what is happening","tag_arrow":"Very short (max 6 words) — key takeaway"}}
+
+SITUATION GUIDE:
+- CONFIRMED_MOVE: News AND market data agree on direction
+- HYPE: Lots of news excitement but weak actual buying/selling
+- QUIET_OPPORTUNITY: Strong market move but little news coverage
+- CONFLICT: News says one thing, market data says opposite
+- NO_DATA: No meaningful news or signal
+
+CRITICAL RULES:
+- If headlines mention earnings, dividends, acquisitions, profit results — mention them DIRECTLY in line1
+- NEVER use: bullish, bearish, RSI, resistance, support, technical, fundamentals
+- Keep line1 and line2 under 20 words each
+- verdict must be actionable — max 18 words
+"""
+
+def _call_ai_for_sentiment(prompt: str):
+    import requests as _req, json as _json
+    for key_name, make_req in [
+        ("GROQ_API_KEY", lambda k: (
+            "https://api.groq.com/openai/v1/chat/completions",
+            {"model": "llama-3.1-8b-instant", "messages": [{"role": "user", "content": prompt}], "max_tokens": 320, "temperature": 0.25},
+            {"Authorization": f"Bearer {k}", "Content-Type": "application/json"},
+            lambda d: d["choices"][0]["message"]["content"],
+        )),
+        ("GEMINI_API_KEY", lambda k: (
+            f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash-latest:generateContent?key={k}",
+            {"contents": [{"parts": [{"text": prompt}]}], "generationConfig": {"maxOutputTokens": 320, "temperature": 0.25}},
+            {},
+            lambda d: d["candidates"][0]["content"]["parts"][0]["text"],
+        )),
+    ]:
+        key = st.secrets.get(key_name, "")
+        if not key:
+            continue
+        try:
+            url, payload, headers, extract = make_req(key)
+            r = _req.post(url, json=payload, headers=headers, timeout=20)
+            if r.status_code != 200:
+                continue
+            raw  = extract(r.json()).strip().replace("```json", "").replace("```", "").strip()
+            data = _json.loads(raw)
+            if {"situation","line1","line2","verdict","tag_line1","tag_arrow"}.issubset(data.keys()):
+                return data
+        except Exception:
+            continue
+    return None
+
+
+# ── Layer 3: Number-based fallback ────────────────────────────────────────────
+
+def _fallback_sentiment(symbol, signal_code, chg, vol_score, momentum, composite, volume):
+    is_gain = chg >= 0
+    abs_chg = abs(chg)
+    no_data = (vol_score < 0.10 and composite < 0.15 and volume < 100)
+    if no_data:
+        return {"situation":"NO_DATA","line1":"No recent news or strong public reaction found for this stock.","line2":"","verdict":"Rely on the score breakdown above — no news signal available.","tag_line1":"No recent news found","tag_arrow":"Technical signals only","color":"#4B5563"}
+    price_direction = 0.65 if chg >= 3 else 0.55 if chg >= 0.5 else 0.45 if chg > -0.5 else 0.3
+    market_score    = momentum * 0.5 + vol_score * 0.3 + price_direction * 0.2
+    market_strong   = market_score >= 0.55 and (chg >= 1.0 or momentum >= 0.55)
+    if   abs_chg >= 5 and is_gain:    move_word = "rising sharply"
+    elif abs_chg >= 2 and is_gain:    move_word = "moving up steadily"
+    elif abs_chg >= 0.5 and is_gain:  move_word = "edging higher"
+    elif abs_chg < 0.5:               move_word = "barely moving"
+    elif abs_chg >= 5:                move_word = "falling sharply"
+    elif abs_chg >= 2:                move_word = "dropping noticeably"
+    else:                             move_word = "slipping lower"
+    vol_word = "strong trading activity" if vol_score >= 0.65 else "above-average trading activity" if vol_score >= 0.40 else "quiet trading activity"
+    if market_strong and is_gain:
+        return {"situation":"QUIET_OPPORTUNITY","line1":f"No major news found — but {symbol} is {move_word} on {vol_word}.","line2":"The buying pressure looks real even without a news catalyst.","verdict":"Price is moving on its own strength — watch for a news trigger.","tag_line1":"Moving on market strength, no news","tag_arrow":"Under-the-radar buying","color":"#A78BFA"}
+    elif not is_gain:
+        return {"situation":"CONFIRMED_MOVE","line1":f"No major news found, but {symbol} is {move_word}.","line2":f"Selling pressure appears real — {vol_word} behind the drop.","verdict":"Price is dropping without clear news reason — use caution.","tag_line1":"Dropping without a clear news reason","tag_arrow":"Proceed with caution","color":"#EF4444"}
+    else:
+        return {"situation":"QUIET_OPPORTUNITY","line1":f"No major news found for {symbol} today.","line2":f"The price is {move_word} on {vol_word}.","verdict":"Moving quietly — no news catalyst yet. Watch for one.","tag_line1":"Quiet move — no news found","tag_arrow":"No news trigger yet","color":"#D97706"}
+
+
+# ── Situation → color ─────────────────────────────────────────────────────────
+
+_SITUATION_COLOR = {"CONFIRMED_MOVE": None, "HYPE": "#F0A500", "QUIET_OPPORTUNITY": "#A78BFA", "CONFLICT": "#3B82F6", "NO_DATA": "#4B5563"}
+
+
+# ── Main public function ──────────────────────────────────────────────────────
+
+def generate_market_reality_block(symbol: str, signal_code: str, chg: float, volume: int, momentum: float, vol_score: float, composite: float, stars: int) -> dict:
+    """
+    Public entry point. Returns a sentiment dict.
+    Flow: cache → Google News RSS → Groq/Gemini AI → number fallback → cache
+    """
+    # 1. Cache check
     if _cache_is_fresh(symbol):
         cached = _get_cache(symbol)
         if cached:
             return cached
 
-    # ── Derive weighted sentiment score (0–1) ────────────────────────────────
-    # Weights: news/composite 40%, social proxy 30%, market behavior 30%
-    # "Social proxy" = composite score variance + hashlib-seeded daily noise
-    # (prevents every stock showing the same sentiment without real social API)
-    _hash_noise = (int(hashlib.md5(f"{symbol}{str(datetime.utcnow().date())}".encode()).hexdigest(), 16) % 200 - 100) / 1000
-    social_proxy = max(0.0, min(1.0, composite + _hash_noise))
+    # 2. Fetch real news headlines
+    headlines = fetch_stock_news(symbol, max_items=5)
 
-    # Market behavior score: blend of momentum, vol_score, and price direction
-    price_direction = 0.65 if chg >= 3 else 0.55 if chg >= 0.5 else 0.45 if chg > -0.5 else 0.3
-    market_score    = momentum * 0.5 + vol_score * 0.3 + price_direction * 0.2
+    # 3. AI interpretation
+    result = None
+    prompt  = _build_sentiment_prompt(symbol, headlines, signal_code, chg, volume, momentum, vol_score)
+    ai_data = _call_ai_for_sentiment(prompt)
 
-    # Weighted sentiment
-    weighted = composite * 0.40 + social_proxy * 0.30 + market_score * 0.30
-
-    # ── Filter: suppress low-signal noise ────────────────────────────────────
-    # Very low volume + very low composite = no strong data → use fallback
-    no_data = (vol_score < 0.10 and composite < 0.15 and volume < 100)
-
-    # ── Classify situation ────────────────────────────────────────────────────
-    # CONFIRMED_MOVE : external sentiment (news/social) AND market behavior both agree
-    # HYPE           : external sentiment high, but market behavior weak
-    # QUIET_OPPORTUNITY : market behavior strong, but little external attention
-    # CONFLICT       : external sentiment and market behavior point opposite ways
-
-    social_excited  = (composite >= 0.55 or social_proxy >= 0.55)
-    market_strong   = (market_score >= 0.55 and (chg >= 1.0 or momentum >= 0.55))
-    social_negative = (composite <= 0.35 and chg < 0)
-    market_weak     = (market_score < 0.40 or (vol_score < 0.30 and momentum < 0.35))
-    trending_up     = signal_code in ("STRONG_BUY", "BUY", "BREAKOUT_WATCH")
-    trending_down   = signal_code in ("AVOID", "CAUTION")
-
-    if trending_up and social_excited and market_strong:
-        situation = "CONFIRMED_MOVE"
-    elif trending_down and social_negative and market_weak:
-        situation = "CONFIRMED_MOVE"   # Confirmed downward move
-    elif social_excited and market_weak:
-        situation = "HYPE"
-    elif market_strong and not social_excited:
-        situation = "QUIET_OPPORTUNITY"
-    elif trending_up and social_negative:
-        situation = "CONFLICT"
-    elif trending_down and social_excited:
-        situation = "CONFLICT"
-    elif market_strong:
-        situation = "QUIET_OPPORTUNITY"
-    else:
-        situation = "HYPE" if social_excited else "QUIET_OPPORTUNITY"
-
-    # ── Generate plain-English lines ──────────────────────────────────────────
-    abs_chg   = abs(chg)
-    is_gain   = chg >= 0
-
-    # Volume context words
-    if vol_score >= 0.70:
-        vol_word = "a lot of trading activity"
-    elif vol_score >= 0.45:
-        vol_word = "above-average trading activity"
-    elif vol_score >= 0.25:
-        vol_word = "normal trading activity"
-    else:
-        vol_word = "very little trading activity"
-
-    # Price move context
-    if abs_chg >= 5 and is_gain:
-        move_word = "rising sharply"
-    elif abs_chg >= 2 and is_gain:
-        move_word = "moving up steadily"
-    elif abs_chg >= 0.5 and is_gain:
-        move_word = "edging higher"
-    elif abs_chg < 0.5:
-        move_word = "barely moving"
-    elif abs_chg >= 5:
-        move_word = "falling sharply"
-    elif abs_chg >= 2:
-        move_word = "dropping noticeably"
-    else:
-        move_word = "slipping lower"
-
-    # ── Situation-specific text ────────────────────────────────────────────────
-    if no_data:
+    if ai_data:
+        situation = ai_data.get("situation", "NO_DATA")
+        is_gain   = chg >= 0
+        color     = ("#22C55E" if is_gain else "#EF4444") if situation == "CONFIRMED_MOVE" else _SITUATION_COLOR.get(situation, "#4B5563")
         result = {
-            "situation": "NO_DATA",
-            "line1":   "No major news or strong public reaction around this stock right now.",
-            "line2":   "",
-            "verdict": "No clear signal from public attention — rely on the score breakdown above.",
-            "tag_line1": "Little public attention on this stock today",
-            "tag_arrow": "Moving quietly in the background",
-            "color":   "#4B5563",
+            "situation":  situation,
+            "line1":      ai_data.get("line1",     ""),
+            "line2":      ai_data.get("line2",     ""),
+            "verdict":    ai_data.get("verdict",   ""),
+            "tag_line1":  ai_data.get("tag_line1", ""),
+            "tag_arrow":  ai_data.get("tag_arrow", ""),
+            "color":      color,
+            "news_count": len(headlines),
+            "ai_powered": True,
         }
-        _set_cache(symbol, result)
-        return result
 
-    if situation == "CONFIRMED_MOVE" and is_gain:
-        line1   = f"Investors are actively buying {symbol} and news coverage is supportive."
-        line2   = f"The price is {move_word} with {vol_word} — the buying looks real, not just noise."
-        verdict = "This looks like a genuine upward move with real support behind it."
-        tag1    = f"Investors are buying and news is backing it up"
-        tag_arr = "Getting genuine attention today"
-        color   = "#22C55E"
+    # 4. Fallback if AI failed
+    if not result:
+        result = _fallback_sentiment(symbol, signal_code, chg, vol_score, momentum, composite, volume)
+        result["news_count"] = len(headlines)
+        result["ai_powered"] = False
 
-    elif situation == "CONFIRMED_MOVE" and not is_gain:
-        line1   = f"Investors are stepping back from {symbol} and recent coverage has been negative."
-        line2   = f"The price is {move_word} with {vol_word} — the selling pressure appears real."
-        verdict = "This looks like a genuine downward move — wait before considering a position."
-        tag1    = "People are selling and news is not helping"
-        tag_arr = "Price is dropping for real reasons"
-        color   = "#EF4444"
-
-    elif situation == "HYPE":
-        if is_gain:
-            line1   = f"People are excited about {symbol} — it's getting a lot of attention online and in the news."
-            line2   = f"But the actual price movement is {move_word} and the buying strength is still modest."
-            verdict = "Excitement is high, but the price may not hold for long — watch carefully before acting."
-            tag1    = "People are talking about it more than actually buying"
-            tag_arr = "Hype is driving today's attention"
-            color   = "#F0A500"
-        else:
-            line1   = f"There's some negative noise around {symbol} online and in recent headlines."
-            line2   = f"But the actual market reaction is mild — the price is only {move_word}."
-            verdict = "The reaction looks bigger than the actual move — don't panic yet."
-            tag1    = "Noise online, but limited real selling"
-            tag_arr = "Reaction may be bigger than the real move"
-            color   = "#D97706"
-
-    elif situation == "QUIET_OPPORTUNITY":
-        if is_gain:
-            line1   = f"There isn't much public chatter or news about {symbol} right now."
-            line2   = f"But behind the scenes, the price is {move_word} with {vol_word}."
-            verdict = "This stock is moving without much noise — which sometimes means serious investors are buying quietly."
-            tag1    = "Moving quietly without public attention"
-            tag_arr = "Under-the-radar activity today"
-            color   = "#A78BFA"
-        else:
-            line1   = f"{symbol} isn't attracting much public attention right now."
-            line2   = f"But the price is {move_word} with {vol_word} — the drop is happening quietly."
-            verdict = "Low attention doesn't mean no risk — the price is moving in the wrong direction."
-            tag1    = "Dropping quietly without much notice"
-            tag_arr = "Slipping lower without much attention"
-            color   = "#EA580C"
-
-    else:  # CONFLICT
-        if is_gain:
-            line1   = f"Many people believe {symbol} will keep going up — news and online chatter are positive."
-            line2   = f"But the actual market data shows mixed signals — buying strength is not as strong as the excitement suggests."
-            verdict = "The market is divided. The public mood is positive, but the price action is not fully backing it up — move carefully."
-            tag1    = "Public is excited, but market is less convinced"
-            tag_arr = "Split signals — wait for more clarity"
-            color   = "#3B82F6"
-        else:
-            line1   = f"Many people believe {symbol} will keep dropping — sentiment online is negative."
-            line2   = f"But some market signals point in the other direction — actual selling pressure is weaker than expected."
-            verdict = "The market is divided. Be cautious about following the crowd here — the picture is not clear yet."
-            tag1    = "People are nervous, but selling is limited"
-            tag_arr = "Mixed signals — don't rush a decision"
-            color   = "#3B82F6"
-
-    result = {
-        "situation": situation,
-        "line1":     line1,
-        "line2":     line2,
-        "verdict":   verdict,
-        "tag_line1": tag1,
-        "tag_arrow": tag_arr,
-        "color":     color,
-    }
+    # 5. Cache and return
     _set_cache(symbol, result)
     return result
 
@@ -459,21 +516,35 @@ def render_market_reality_html(mri: dict, accent: str) -> str:
     Inlined inside the existing st.components.v1.html card.
     Placed ABOVE the rich narrative, BELOW the score bars.
     """
-    situation = mri["situation"]
-    line1     = mri["line1"]
-    line2     = mri["line2"]
-    verdict   = mri["verdict"]
-    color     = mri["color"]
+    situation  = mri["situation"]
+    line1      = mri["line1"]
+    line2      = mri["line2"]
+    verdict    = mri["verdict"]
+    color      = mri["color"]
+    news_count = mri.get("news_count", 0)
+    ai_powered = mri.get("ai_powered", False)
 
-    # Situation badge copy
+    # Situation badge
     badge_copy = {
-        "CONFIRMED_MOVE":    ("✅", "Confirmed Move",     color),
-        "HYPE":              ("⚠️", "Hype Alert",          "#F0A500"),
-        "QUIET_OPPORTUNITY": ("🔍", "Quiet Opportunity",   "#A78BFA"),
-        "CONFLICT":          ("⚖️", "Mixed Signals",        "#3B82F6"),
-        "NO_DATA":           ("—",  "No Strong Data",      "#4B5563"),
+        "CONFIRMED_MOVE":    ("✅", "Confirmed Move",   color),
+        "HYPE":              ("⚠️", "Hype Alert",        "#F0A500"),
+        "QUIET_OPPORTUNITY": ("🔍", "Quiet Opportunity", "#A78BFA"),
+        "CONFLICT":          ("⚖️", "Mixed Signals",      "#3B82F6"),
+        "NO_DATA":           ("—",  "No Strong Data",    "#4B5563"),
     }
     b_icon, b_label, b_color = badge_copy.get(situation, ("—", situation, "#4B5563"))
+
+    # Source indicator line
+    if ai_powered and news_count > 0:
+        source_html = (
+            f'<div class="mri-source">'
+            f'📰 Based on {news_count} recent headline{"s" if news_count != 1 else ""} · AI-analysed'
+            f'</div>'
+        )
+    elif ai_powered and news_count == 0:
+        source_html = '<div class="mri-source">🤖 AI analysis · No recent headlines found</div>'
+    else:
+        source_html = '<div class="mri-source">📊 Based on market signals · News unavailable</div>'
 
     if situation == "NO_DATA":
         return f"""
@@ -483,6 +554,7 @@ def render_market_reality_html(mri: dict, accent: str) -> str:
     <span class="mri-badge" style="background:{b_color}18;border-color:{b_color}44;color:{b_color};">{b_icon} {b_label}</span>
   </div>
   <div class="mri-no-data">{line1}</div>
+  {source_html}
 </div>"""
 
     line2_html = f'<div class="mri-line">{line2}</div>' if line2 else ""
@@ -501,6 +573,7 @@ def render_market_reality_html(mri: dict, accent: str) -> str:
       <span class="mri-verdict-text" style="color:{color};">{verdict}</span>
     </div>
   </div>
+  {source_html}
 </div>"""
 
 
@@ -577,6 +650,14 @@ MRI_CSS = """
     line-height: 1.6;
     font-style: italic;
   }
+  .mri-source {
+    font-size: 9px;
+    color: #374151;
+    margin-top: 7px;
+    padding-top: 5px;
+    border-top: 1px solid #12151A;
+    letter-spacing: 0.02em;
+  }
 """
 
 
@@ -594,24 +675,32 @@ def generate_trending_sentiment_tag(
 ) -> str:
     """
     Returns an HTML string for the TrendingSentimentTag.
-    One-to-two lines explaining WHY the stock is trending.
+    Explains WHY the stock is trending using real news + AI interpretation.
     Used inside the Trending Now cards on home.py.
     """
-    mri = generate_market_reality_block(
+    mri        = generate_market_reality_block(
         symbol=symbol, signal_code=signal_code,
         chg=chg, volume=volume, momentum=momentum,
         vol_score=vol_score, composite=composite, stars=stars,
     )
-    color   = mri["color"]
-    tag1    = mri["tag_line1"]
-    tag_arr = mri["tag_arrow"]
+    color      = mri["color"]
+    tag1       = mri["tag_line1"]
+    tag_arr    = mri["tag_arrow"]
+    news_count = mri.get("news_count", 0)
+    ai_powered = mri.get("ai_powered", False)
+
+    source_note = (
+        f'<span style="color:#374151;font-size:9px;"> · {news_count} headline{"s" if news_count!=1 else ""}</span>'
+        if ai_powered and news_count > 0 else ""
+    )
 
     return (
         f'<div style="font-family:\'DM Mono\',monospace;font-size:10px;'
-        f'color:#9CA3AF;line-height:1.55;margin-top:5px;padding-top:5px;'
+        f'color:#9CA3AF;line-height:1.6;margin-top:6px;padding-top:6px;'
         f'border-top:1px solid #1A1D24;">'
         f'{tag1}<br>'
         f'<span style="color:{color};font-weight:600;">→ {tag_arr}</span>'
+        f'{source_note}'
         f'</div>'
     )
 
@@ -1046,6 +1135,14 @@ def render():
                 color: #4B5563;
                 line-height: 1.6;
                 font-style: italic;
+              }}
+              .mri-source {{
+                font-size: 9px;
+                color: #374151;
+                margin-top: 7px;
+                padding-top: 5px;
+                border-top: 1px solid #12151A;
+                letter-spacing: 0.02em;
               }}
             </style>
             <script>
