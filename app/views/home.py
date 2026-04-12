@@ -1123,7 +1123,7 @@ def _render_performance_trust(gainers, losers, total, top_g, now):
 
 def _render_ai_section(tier, is_visitor, is_free, is_trial, is_starter, is_pro, is_trader,
                        has_full_ai, ai_allowed, insights, _sig_visible, top_g, now, market,
-                       ad, moji, mood, tier_prompt_args):
+                       ad, moji, mood, tier_prompt_args, key_suffix=""):
     """Full AI Chat section (unchanged logic, reused)"""
     if "mai_history"  not in st.session_state: st.session_state.mai_history = []
     if "mai_pending"  not in st.session_state: st.session_state.mai_pending = ""
@@ -1208,7 +1208,7 @@ def _render_ai_section(tier, is_visitor, is_free, is_trial, is_starter, is_pro, 
                 st.markdown(f'<div style="background:rgba(240,165,0,.05);border:1px solid rgba(240,165,0,.2);border-radius:8px;padding:12px 16px;margin-bottom:10px;font-family:DM Mono,monospace;"><div style="font-size:12px;font-weight:700;color:#F0A500;margin-bottom:5px;">🔒 Unlock full AI analysis</div><div style="font-size:11px;color:#808080;margin-bottom:8px;line-height:1.6;">Your plan ({tier.upper()}): limited AI response. Upgrade for complete breakdown.</div></div>', unsafe_allow_html=True)
                 _,_bc,_ = st.columns([1,2,1])
                 with _bc:
-                    if st.button("🚀 Unlock Full AI Insights →", key="ai_blur_cta", type="primary", use_container_width=True):
+                    if st.button("🚀 Unlock Full AI Insights →", key=f"ai_blur_cta{key_suffix}", type="primary", use_container_width=True):
                         st.session_state.current_page = "settings"; st.rerun()
             else:
                 st.markdown(f'<div class="ai-msg-bot">{c}</div>', unsafe_allow_html=True)
@@ -1801,7 +1801,7 @@ def render():
         st.markdown('<div class="sec-title">✨ Market AI — Ask Anything</div>', unsafe_allow_html=True)
         _render_ai_section(tier, is_visitor, is_free, is_trial, is_starter, is_pro, is_trader,
                            has_full_ai, ai_allowed, insights, _sig_visible, top_g, now, market,
-                           ad, moji, mood, _pai)
+                           ad, moji, mood, _pai, key_suffix="_funnel")
 
         st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
 
@@ -1949,7 +1949,7 @@ def render():
 
         _render_ai_section(tier, is_visitor, is_free, is_trial, is_starter, is_pro, is_trader,
                            has_full_ai, ai_allowed, insights, _sig_visible, top_g, now, market,
-                           ad, moji, mood, _pai)
+                           ad, moji, mood, _pai, key_suffix="_dash")
 
         st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
 
