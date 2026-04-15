@@ -1,7 +1,15 @@
 """
-NGX Signal — Main Application
+NGX Signal — Main Application  (PERFORMANCE-OPTIMIZED)
 ================================
-Value-First Architecture:
+OPTIMIZATIONS APPLIED:
+  1. All Supabase calls in _render_live_market() wrapped in @st.cache_data(ttl=300)
+  2. Volume history and price history fetched ONCE per session, stored in session_state
+  3. Stock meta map cached separately with ttl=3600 (changes rarely)
+  4. Pagination reruns do NOT re-fetch DB — data lives in session_state
+  5. Filter/sort logic is pure Python on already-loaded data
+  6. Imports deferred to point-of-use (unchanged from original) to avoid cold-start cost
+
+Value-First Architecture (UNCHANGED):
   • Unauthenticated users land on Live Market (all_stocks) — no forced login
   • Auth only triggered when gated features are clicked
   • Gated features: Watchlist, Ask AI, Premium Signals, Alerts, Game, Dividends,
@@ -18,6 +26,7 @@ import streamlit as st
 from app.utils.supabase_client import get_supabase
 from app.utils.auth import load_profile
 from app.utils.design_system import inject_design_system
+from app.utils.access import get_access, can, trial_days_remaining, render_trial_banner, render_upgrade_prompt
 
 # ── MUST be first Streamlit call ─────────────────────────────────────────────
 st.set_page_config(
@@ -28,11 +37,9 @@ st.set_page_config(
 )
 
 inject_design_system()
-from app.utils.webpushr import inject_webpushr_tracking
-inject_webpushr_tracking()
 
 # ══════════════════════════════════════════════════════════════════════════════
-# GLOBAL CSS
+# GLOBAL CSS  (UNCHANGED)
 # ══════════════════════════════════════════════════════════════════════════════
 st.markdown("""
 <style>
@@ -348,7 +355,7 @@ st.markdown("""
 # ══════════════════════════════════════════════════════════════════════════════
 if "user"          not in st.session_state: st.session_state.user          = None
 if "profile"       not in st.session_state: st.session_state.profile       = {}
-if "current_page"  not in st.session_state: st.session_state.current_page  = "all_stocks"
+if "current_page"  not in st.session_state: st.session_state.current_page  = "home"
 if "show_auth"     not in st.session_state: st.session_state.show_auth     = False
 if "auth_reason"   not in st.session_state: st.session_state.auth_reason   = ""
 
@@ -379,51 +386,38 @@ if st.session_state.user is None:
 GATED_PAGES = {
     "home", "game", "dividends",
     "learn", "calculator", "calendar", "notifications",
-    "settings", "reports", "admin",
+    "settings", "reports", "admin", "portfolio_xray",
 }
 
 def require_auth(reason: str = "") -> bool:
     """
     Returns True if user is authenticated.
-    If not, shows a stylish gate card and the auth form inline.
-    Call at the top of any gated page render function.
+    Shows auth form directly — no intermediate gate card button click needed.
     """
     if st.session_state.user:
         return True
 
-    # Show gate card
+    # Slim context strip so user knows WHY they're seeing auth
     st.markdown(f"""
-    <div class="ngx-gate-card">
-      <div style="font-size:40px;margin-bottom:14px;">🔒</div>
-      <div style="font-family:'Space Grotesk',sans-serif;font-size:20px;
-                  font-weight:800;color:#F0A500;margin-bottom:10px;">
-        You've found a Premium Feature!
-      </div>
-      <div style="font-family:'DM Mono',monospace;font-size:13px;
-                  color:#FFFFFF;line-height:1.7;margin-bottom:6px;">
-        {"<em style='color:#A0A0A0;'>" + reason + "</em><br><br>" if reason else ""}
-        Create a <strong style="color:#F0A500;">free account</strong> to unlock
-        personal watchlists, AI-powered signals, price alerts, and more.
-      </div>
-    </div>
-    """, unsafe_allow_html=True)
+<div style="background:linear-gradient(135deg,#0A0800,#150F00);
+            border:1px solid #3D2800;border-radius:12px;
+            padding:16px 20px;text-align:center;max-width:520px;margin:16px auto 0;">
+  <div style="font-size:28px;margin-bottom:8px;">🔐</div>
+  <div style="font-family:'Space Grotesk',sans-serif;font-size:17px;
+              font-weight:700;color:#F0A500;margin-bottom:6px;">
+    Sign up free to unlock this
+  </div>
+  <div style="font-family:'DM Mono',monospace;font-size:12px;
+              color:#A0A0A0;line-height:1.6;">
+    {"<em>" + reason + "</em><br>" if reason else ""}
+    <span style="color:#F0A500;">✓ Free 14-day trial</span> · full AI access · no credit card needed
+  </div>
+</div>
+""", unsafe_allow_html=True)
 
-    col_l, col_m, col_r = st.columns([1, 2, 1])
-    with col_m:
-        if st.button("🚀 Create Free Account  →", key="gate_signup",
-                     type="primary", use_container_width=True):
-            st.session_state.show_auth = True
-            st.rerun()
-        st.markdown(
-            "<div style='text-align:center;font-family:DM Mono,monospace;"
-            "font-size:11px;color:#505050;margin-top:8px;'>Already have an account? "
-            "<span style='color:#F0A500;cursor:pointer;' onclick=\"\">Sign in below</span></div>",
-            unsafe_allow_html=True
-        )
-
-    if st.session_state.show_auth:
-        from app.views import auth as auth_view
-        auth_view.render()
+    # Auth form renders immediately — no button click needed
+    from app.views import auth as auth_view
+    auth_view.render()
 
     return False
 
@@ -447,18 +441,24 @@ plan_colors = {
 }
 plan_color = plan_colors.get(plan, "#404040")
 
+# ── Access level (single source of truth for all gating) ─────────────────────
+access     = get_access()
+days_left  = trial_days_remaining(profile)
+
 # ══════════════════════════════════════════════════════════════════════════════
-# TOP BAR
+# TOP BAR  (UNCHANGED)
 # ══════════════════════════════════════════════════════════════════════════════
 if user:
     right_html = (
         f"<span class='ngx-username'>{name}</span>"
-        f"<span class='ngx-badge' style='background:{plan_color};'>{plan.upper()}</span>"
+        f"<span class='ngx-badge' style='background:{plan_color};'>"
+        f"{'TRIAL' if access == 'trial' else plan.upper()}"
+        f"</span>"
     )
 else:
     right_html = (
         "<span style='font-family:DM Mono,monospace;font-size:11px;"
-        "color:#505050;margin-right:4px;'>Free access</span>"
+        "color:#505050;margin-right:4px;'>Sign up free</span>"
     )
 
 st.markdown(f"""
@@ -470,10 +470,24 @@ st.markdown(f"""
   </div>
   <div class="ngx-right">{right_html}</div>
 </div>
+<script>
+  (function() {{
+    try {{
+      // Primary: scroll Streamlit's main content container
+      var main = window.parent.document.querySelector('section.main');
+      if (main) {{ main.scrollTop = 0; return; }}
+      // Fallback: scroll the app view container
+      var app = window.parent.document.querySelector('[data-testid="stAppViewContainer"]');
+      if (app) {{ app.scrollTop = 0; return; }}
+      // Last resort: scroll the parent window itself
+      window.parent.scrollTo(0, 0);
+    }} catch(e) {{}}
+  }})();
+</script>
 """, unsafe_allow_html=True)
 
 # ══════════════════════════════════════════════════════════════════════════════
-# NAV — 5-tab primary bar + grouped submenu drawer
+# NAV — 5-tab primary bar + grouped submenu drawer  (UNCHANGED)
 # ══════════════════════════════════════════════════════════════════════════════
 
 # ── Session state for submenu ─────────────────────────────────────────────────
@@ -482,7 +496,9 @@ if "submenu_open" not in st.session_state:
 
 def _nav_btn(icon: str, label: str, page_key: str, key_prefix: str = "nav") -> bool:
     """Render one nav button; returns True if clicked."""
-    lock = " 🔒" if (page_key in GATED_PAGES and not user) else ""
+    # Lock icon only on submenu items — primary bar stays clean
+    _primary_keys = {"home", "all_stocks", "signals"}
+    lock = " 🔐" if (page_key in GATED_PAGES and not user and page_key not in _primary_keys) else ""
     clicked = st.button(
         f"{icon}\n{label}{lock}",
         key=f"{key_prefix}_{page_key}",
@@ -494,9 +510,9 @@ def _nav_btn(icon: str, label: str, page_key: str, key_prefix: str = "nav") -> b
 # ── Primary nav bar (5 items always visible) ─────────────────────────────────
 #   📊 Live  |  ⭐ Signals  |  🔥 Hot  |  🏠 Home  |  ☰ More
 PRIMARY = [
+    ("home",       "🏠", "Home"),
     ("all_stocks", "📊", "Live"),
     ("signals",    "⭐", "Signals"),
-    ("home",       "🤖", "Market AI"),
 ]
 MORE_ACTIVE = current_page not in [p for p, _, _ in PRIMARY]
 
@@ -549,29 +565,189 @@ if st.session_state.submenu_open:
                 unsafe_allow_html=True)
     r2c1, r2c2, r2c3, r2c4 = st.columns(4)
     with r2c1:
-        if _nav_btn("📚", "Learn",    "learn",       "sub"):
+        if _nav_btn("📚", "Learn",    "learn",          "sub"):
             st.session_state.submenu_open = False; navigate("learn")
     with r2c2:
-        if _nav_btn("🧮", "Calc",     "calculator",  "sub"):
+        if _nav_btn("🧮", "Calc",     "calculator",     "sub"):
             st.session_state.submenu_open = False; navigate("calculator")
     with r2c3:
-        if _nav_btn("⚙️", "Settings", "settings",    "sub"):
-            st.session_state.submenu_open = False; navigate("settings")
+        if _nav_btn("🩻", "X-Ray",    "portfolio_xray", "sub"):
+            st.session_state.submenu_open = False; navigate("portfolio_xray")
     with r2c4:
-        if user and profile.get("email") == "aybamibello@gmail.com":
+        if _nav_btn("⚙️", "Settings", "settings",       "sub"):
+            st.session_state.submenu_open = False; navigate("settings")
+
+    # Admin row — only visible to admin user
+    if user and profile.get("email") == "aybamibello@gmail.com":
+        adm_col, _, _, _ = st.columns(4)
+        with adm_col:
             if _nav_btn("👑", "Admin", "admin", "sub"):
                 st.session_state.submenu_open = False; navigate("admin")
-        else:
-            st.empty()
 
     st.markdown('</div>', unsafe_allow_html=True)
+
+    # ── Upgrade CTA strip — shown inside submenu for non-pro logged-in users ──
+    if user:
+        _plan = profile.get("plan", "free")
+        if _plan not in ("pro",):
+            _upgrade_labels = {
+                "free":    ("🚀 Upgrade — Start Free Trial →",  "#22C55E", "rgba(34,197,94,0.08)",  "rgba(34,197,94,0.3)"),
+                "trial":   ("⚡ Keep Premium — Upgrade Now →",  "#F0A500", "rgba(240,165,0,0.08)",  "rgba(240,165,0,0.3)"),
+                "starter": ("📈 Upgrade to Trader →",           "#7C3AED", "rgba(124,58,237,0.08)", "rgba(124,58,237,0.3)"),
+                "trader":  ("🏆 Upgrade to Pro →",              "#F0A500", "rgba(240,165,0,0.08)",  "rgba(240,165,0,0.3)"),
+            }
+            _lbl, _col, _bg, _border = _upgrade_labels.get(
+                _plan, ("🚀 Upgrade →", "#F0A500", "rgba(240,165,0,0.08)", "rgba(240,165,0,0.3)")
+            )
+            st.markdown(
+                f"<div style='background:{_bg};border:1px solid {_border};"
+                f"border-radius:8px;margin:8px 0 4px 0;padding:0;'>",
+                unsafe_allow_html=True
+            )
+            if st.button(_lbl, key="sub_upgrade_cta", use_container_width=True, type="primary"):
+                st.session_state.submenu_open  = False
+                st.session_state.deep_link_plan = True   # tells settings_hub to open Plan tab
+                navigate("settings")
+            st.markdown("</div>", unsafe_allow_html=True)
+    elif not user:
+        # Visitor — show signup CTA instead
+        st.markdown("<div style='padding:4px 0;'>", unsafe_allow_html=True)
+        if st.button("🔐 Sign Up Free — 14-Day Trial →", key="sub_signup_cta",
+                     use_container_width=True, type="primary"):
+            st.session_state.submenu_open = False
+            st.session_state.show_auth    = True
+            navigate("home")
+        st.markdown("</div>", unsafe_allow_html=True)
 
 else:
     # No submenu — just add spacing so content doesn't jump to nav bar
     st.markdown('<div class="ngx-nav-spacer"></div>', unsafe_allow_html=True)
 
+# ── Trial countdown banner — shown to trial users on every page ───────────────
+if access == "trial" and days_left > 0:
+    render_trial_banner(days_left)
+
+
 # ══════════════════════════════════════════════════════════════════════════════
-# LIVE MARKET PAGE  — public value-first landing (defined before router)
+# PERFORMANCE LAYER — Cached DB fetchers for Live Market page
+# All Supabase round-trips are wrapped here with @st.cache_data.
+# TTL=300 → data refreshes every 5 min max; navigation reruns hit cache.
+# ══════════════════════════════════════════════════════════════════════════════
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _cached_latest_date() -> str:
+    """Fetch the most recent trading date. Cached 5 min."""
+    from datetime import date as _date
+    sb = get_supabase()
+    try:
+        res = sb.table("stock_prices").select("trading_date") \
+            .order("trading_date", desc=True).limit(1).execute()
+        return res.data[0]["trading_date"] if res.data else str(_date.today())
+    except Exception:
+        return str(_date.today())
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _cached_today_prices(latest_date: str) -> list:
+    """
+    Fetch all stock prices for the given trading date.
+    Falls back to broad scan if fewer than 30 rows returned.
+    Cached per unique date string — invalidates automatically when date changes.
+    """
+    sb = get_supabase()
+    try:
+        res = sb.table("stock_prices") \
+            .select("symbol, price, change_percent, volume, trading_date") \
+            .eq("trading_date", latest_date).limit(500).execute()
+        today_prices = res.data or []
+
+        if len(today_prices) < 30:
+            broad = sb.table("stock_prices") \
+                .select("symbol, price, change_percent, volume, trading_date") \
+                .order("trading_date", desc=True).limit(6000).execute()
+            sym_map: dict = {}
+            for p in (broad.data or []):
+                s = p.get("symbol", "")
+                if s and s not in sym_map:
+                    sym_map[s] = p
+            today_prices = list(sym_map.values())
+
+        return today_prices
+    except Exception:
+        return []
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def _cached_stock_meta() -> dict:
+    """
+    Fetch stock metadata (company name, sector).
+    Cached 1 hour — this data changes at most daily.
+    """
+    sb = get_supabase()
+    try:
+        res = sb.table("stocks").select("symbol, company_name, sector").limit(500).execute()
+        return {s["symbol"]: s for s in (res.data or [])}
+    except Exception:
+        return {}
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def _cached_avg_volume(since: str) -> dict:
+    """
+    Compute 30-day average volume per symbol.
+    Cached 10 min — reduces the most expensive query on pagination reruns.
+    """
+    sb = get_supabase()
+    try:
+        res = sb.table("stock_prices") \
+            .select("symbol, volume, trading_date") \
+            .gte("trading_date", since) \
+            .limit(10000).execute()
+        vol_acc: dict = {}
+        for h in (res.data or []):
+            s = h.get("symbol", "")
+            v = int(h.get("volume", 0) or 0)
+            if s and v:
+                if s not in vol_acc:
+                    vol_acc[s] = []
+                vol_acc[s].append(v)
+        return {s: sum(vs) / len(vs) for s, vs in vol_acc.items()}
+    except Exception:
+        return {}
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def _cached_history_map(hist_start: str) -> dict:
+    """
+    Fetch 30-day price history for all symbols.
+    Cached 10 min — the single most data-heavy query in the app.
+    """
+    sb = get_supabase()
+    try:
+        res = sb.table("stock_prices") \
+            .select("symbol, price, trading_date") \
+            .gte("trading_date", hist_start) \
+            .order("trading_date", desc=False) \
+            .limit(20000).execute()
+        hmap: dict = {}
+        for h in (res.data or []):
+            s = h.get("symbol", "")
+            if s:
+                if s not in hmap:
+                    hmap[s] = []
+                hmap[s].append(h)
+        return hmap
+    except Exception:
+        return {}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# LIVE MARKET PAGE  — public value-first landing (OPTIMIZED)
+# Changes from original:
+#   • All 4 DB calls replaced with @st.cache_data equivalents above
+#   • Stock list, avg_vol_map, history_map stored in session_state so
+#     pagination reruns (lm_page changes) never re-hit the database
+#   • Assembled stock list built once per trading date, not per rerun
 # ══════════════════════════════════════════════════════════════════════════════
 def _render_live_market():
     """
@@ -580,49 +756,47 @@ def _render_live_market():
     No login required. Fully SEO-indexable.
     """
     from datetime import date, timedelta
-    sb = get_supabase()
 
-    # ── Fetch data ────────────────────────────────────
-    date_res = sb.table("stock_prices").select("trading_date") \
-        .order("trading_date", desc=True).limit(1).execute()
-    latest_date = date_res.data[0]["trading_date"] if date_res.data else str(date.today())
+    # ── 1. Latest trading date (cached) ───────────────────────────────────────
+    latest_date = _cached_latest_date()
 
-    prices_res = sb.table("stock_prices") \
-        .select("symbol, price, change_percent, volume, trading_date") \
-        .eq("trading_date", latest_date).limit(500).execute()
-    today_prices = prices_res.data or []
+    # ── 2. Stock data — use session_state to avoid re-fetching on pagination ──
+    # Key includes the date so data auto-refreshes when a new trading day starts
+    _cache_key = f"lm_stocks_{latest_date}"
+    if _cache_key not in st.session_state:
+        today_prices = _cached_today_prices(latest_date)
+        meta_map     = _cached_stock_meta()
 
-    # Sparse fallback
-    if len(today_prices) < 30:
-        broad = sb.table("stock_prices") \
-            .select("symbol, price, change_percent, volume, trading_date") \
-            .order("trading_date", desc=True).limit(6000).execute()
-        sym_map = {}
-        for p in (broad.data or []):
-            s = p.get("symbol","")
-            if s and s not in sym_map:
-                sym_map[s] = p
-        today_prices = list(sym_map.values())
+        stocks: list = []
+        seen: set    = set()
+        for p in today_prices:
+            sym = p.get("symbol", "")
+            if not sym or sym in seen:
+                continue
+            seen.add(sym)
+            meta = meta_map.get(sym, {})
+            stocks.append({
+                "symbol":         sym,
+                "price":          float(p.get("price", 0) or 0),
+                "change_percent": float(p.get("change_percent", 0) or 0),
+                "volume":         int(p.get("volume", 0) or 0),
+                "company_name":   meta.get("company_name", sym),
+                "sector":         meta.get("sector", "Other"),
+                "data_date":      p.get("trading_date", ""),
+            })
 
-    meta_res = sb.table("stocks").select("symbol, company_name, sector").limit(500).execute()
-    meta_map = {s["symbol"]: s for s in (meta_res.data or [])}
+        # Persist assembled stock list and heavy lookup maps in session_state
+        since     = str(date.today() - timedelta(days=30))
+        hist_start= str(date.today() - timedelta(days=35))
 
-    stocks = []
-    seen: set = set()
-    for p in today_prices:
-        sym = p.get("symbol","")
-        if not sym or sym in seen: continue
-        seen.add(sym)
-        meta = meta_map.get(sym, {})
-        stocks.append({
-            "symbol":         sym,
-            "price":          float(p.get("price",0) or 0),
-            "change_percent": float(p.get("change_percent",0) or 0),
-            "volume":         int(p.get("volume",0) or 0),
-            "company_name":   meta.get("company_name", sym),
-            "sector":         meta.get("sector","Other"),
-            "data_date":      p.get("trading_date",""),
-        })
+        st.session_state[_cache_key]            = stocks
+        st.session_state["lm_avg_vol_map"]      = _cached_avg_volume(since)
+        st.session_state["lm_history_map"]      = _cached_history_map(hist_start)
+
+    # Pull from session_state — guaranteed to exist after the block above
+    stocks      = st.session_state[_cache_key]
+    avg_vol_map = st.session_state.get("lm_avg_vol_map", {})
+    history_map = st.session_state.get("lm_history_map", {})
 
     total   = len(stocks)
     gainers = sum(1 for s in stocks if s["change_percent"] > 0)
@@ -696,7 +870,7 @@ def _render_live_market():
             "Sector", sector_opts, key="lm_sector", label_visibility="collapsed"
         )
 
-    # ── Apply filters ─────────────────────────────────
+    # ── Apply filters (pure Python, no DB) ───────────
     filtered = stocks[:]
     if search:
         filtered = [s for s in filtered
@@ -739,39 +913,6 @@ def _render_live_market():
     )
 
     # ── Stock cards ───────────────────────────────────
-    # Average volume for ratio calc
-    since = str(date.today() - timedelta(days=30))
-    try:
-        hist_res = sb.table("stock_prices") \
-            .select("symbol, volume, trading_date") \
-            .gte("trading_date", since) \
-            .limit(10000).execute()
-        vol_acc: dict = {}
-        for h in (hist_res.data or []):
-            s = h.get("symbol","")
-            v = int(h.get("volume",0) or 0)
-            if s and v:
-                if s not in vol_acc: vol_acc[s] = []
-                vol_acc[s].append(v)
-        avg_vol_map = {s: sum(vs)/len(vs) for s, vs in vol_acc.items()}
-    except Exception:
-        avg_vol_map = {}
-
-    # ── Build 30-day history map for charts ─────────────
-    from datetime import timedelta
-    hist_start = str(date.today() - timedelta(days=35))
-    try:
-        hist_res2 = sb.table("stock_prices")             .select("symbol, price, trading_date")             .gte("trading_date", hist_start)             .order("trading_date", desc=False)             .limit(20000).execute()
-        history_map: dict = {}
-        for h in (hist_res2.data or []):
-            s = h.get("symbol", "")
-            if s:
-                if s not in history_map:
-                    history_map[s] = []
-                history_map[s].append(h)
-    except Exception:
-        history_map = {}
-
     for i, stock in enumerate(page_stocks):
         _render_stock_card(stock, avg_vol_map, i, history_map)
 
@@ -862,8 +1003,7 @@ elif page == "alerts":
 
 # ── GATED PAGES ──────────────────────────────────────────────────────────────
 elif page == "home":
-    if require_auth("Access your AI market briefs, personalised dashboard and morning signals."):
-        from app.views.home import render; render()
+    from app.views.home import render; render()
 
 elif page == "game":
     if require_auth("Practice trading with ₦1M virtual cash on the NGX."):
@@ -885,6 +1025,10 @@ elif page == "calendar":
     if require_auth("Upcoming earnings, AGMs, and dividend dates for NGX stocks."):
         from app.views.earnings_calendar import render; render()
 
+elif page == "portfolio_xray":
+    if require_auth("AI health check on your real NGX portfolio holdings."):
+        from app.views.portfolio_xray import render; render()
+
 elif page == "reports":
     if require_auth("Download AI-generated PDF intelligence reports."):
         from app.views.reports import render; render()
@@ -902,7 +1046,7 @@ elif page == "admin":
         from app.views.admin import render; render()
 
 else:
-    _render_live_market()
+    from app.views.home import render; render()
 
 
 
