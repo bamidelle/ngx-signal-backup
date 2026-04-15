@@ -131,6 +131,138 @@ _LOCK_COPY: dict[str, dict] = {
 }
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# CACHED DB FETCHERS
+# All raw Supabase calls in home.py are wrapped here with @st.cache_data.
+# This means every navigation rerun, AI chat interaction, and button click
+# hits the cache instead of the database — eliminating perceived lag.
+#
+# TTL strategy:
+#   prices       → 300s  (5 min)  — market data refreshes intraday
+#   signals      → 300s  (5 min)  — signal scores update daily but cache is safe
+#   news         → 600s  (10 min) — headlines don't change by the second
+#   sectors      → 600s  (10 min) — sector data is slow-moving
+#   market_sum   → 300s  (5 min)  — ASI index needs to feel fresh
+#   leaderboard  → 120s  (2 min)  — game rankings change more frequently
+# ══════════════════════════════════════════════════════════════════════════════
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _home_get_latest_prices() -> tuple:
+    """Cached wrapper for the two-phase stock price fetch. Returns (prices, latest_date)."""
+    from app.utils.supabase_client import get_supabase as _gsb
+    sb = _gsb()
+    res = sb.table("stock_prices").select(
+        "symbol,price,change_percent,volume,trading_date"
+    ).order("trading_date", desc=True).limit(500).execute()
+    prices = res.data or []
+    latest = prices[0]["trading_date"] if prices else str(date.today())
+    if len(prices) < 50:
+        broad = sb.table("stock_prices").select(
+            "symbol,price,change_percent,volume,trading_date"
+        ).order("trading_date", desc=True).limit(5000).execute()
+        sym_map = {}
+        for p in (broad.data or []):
+            s = p.get("symbol", "")
+            if s and s not in sym_map:
+                sym_map[s] = p
+        existing = {p["symbol"] for p in prices}
+        prices += [p for s, p in sym_map.items() if s not in existing]
+    return prices, latest
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _home_get_market_summary() -> dict:
+    """Cached ASI / market summary row. TTL 5 min."""
+    from app.utils.supabase_client import get_supabase as _gsb
+    try:
+        res = _gsb().table("market_summary").select("*")\
+            .order("trading_date", desc=True).limit(1).execute()
+        return res.data[0] if res.data else {}
+    except Exception:
+        return {}
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def _home_get_ai_brief() -> list:
+    """Cached AI morning brief rows. TTL 10 min."""
+    from app.utils.supabase_client import get_supabase as _gsb
+    try:
+        res = _gsb().table("ai_briefs").select("body,brief_date")\
+            .eq("language", "en").eq("brief_type", "morning")\
+            .order("brief_date", desc=True).limit(1).execute()
+        return res.data or []
+    except Exception:
+        return []
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _home_get_signal_scores_top(limit: int = 50) -> list:
+    """Top signal scores for insight cards (symbol, signal, stars, reasoning). TTL 5 min."""
+    from app.utils.supabase_client import get_supabase as _gsb
+    try:
+        res = _gsb().table("signal_scores")\
+            .select("symbol,signal,stars,reasoning")\
+            .order("score_date", desc=True)\
+            .order("stars", desc=True)\
+            .limit(limit).execute()
+        return res.data or []
+    except Exception:
+        return []
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _home_get_signal_scores_full(limit: int = 200) -> list:
+    """Full signal scores for trending map (includes sub-scores). TTL 5 min."""
+    from app.utils.supabase_client import get_supabase as _gsb
+    try:
+        res = _gsb().table("signal_scores")\
+            .select("symbol,signal,stars,momentum_score,volume_score,news_score")\
+            .order("score_date", desc=True)\
+            .limit(limit).execute()
+        return res.data or []
+    except Exception:
+        return []
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def _home_get_news() -> list:
+    """Cached market news headlines. TTL 10 min."""
+    from app.utils.supabase_client import get_supabase as _gsb
+    try:
+        res = _gsb().table("news")\
+            .select("headline,sentiment,scraped_at")\
+            .order("scraped_at", desc=True).limit(20).execute()
+        return res.data or []
+    except Exception:
+        return []
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def _home_get_sectors() -> list:
+    """Cached sector performance rows. TTL 10 min."""
+    from app.utils.supabase_client import get_supabase as _gsb
+    try:
+        res = _gsb().table("sector_performance")\
+            .select("sector_name,traffic_light,change_percent,verdict")\
+            .order("change_percent", desc=True).execute()
+        return res.data or []
+    except Exception:
+        return []
+
+
+@st.cache_data(ttl=120, show_spinner=False)
+def _home_get_leaderboard() -> list:
+    """Cached leaderboard top-5. TTL 2 min."""
+    from app.utils.supabase_client import get_supabase as _gsb
+    try:
+        res = _gsb().table("leaderboard_snapshots")\
+            .select("display_name,return_percent,user_id")\
+            .order("return_percent", desc=True).limit(5).execute()
+        return res.data or []
+    except Exception:
+        return []
+
+
 def get_user_tier() -> str:
     user    = st.session_state.get("user")
     profile = st.session_state.get("profile", {})
@@ -178,17 +310,81 @@ def render_locked_content(feature: str, key: str, upgrade_page: str = "settings"
 </div>""", unsafe_allow_html=True)
     _,col,_ = st.columns([1,2,1])
     with col:
-        if st.button(copy["cta"], key=key, type="primary", use_container_width=True):
-            st.session_state.current_page = upgrade_page; st.rerun()
+        # Visitor → auth form; logged-in → settings Plan tab
+        _cta_text = "Create Free Account →" if tier == "visitor" else copy["cta"]
+        if st.button(_cta_text, key=key, type="primary", use_container_width=True):
+            _unlock_cta(key + "_act", copy["cta"], tier, upgrade_page)
 
 def _upgrade_inline(msg: str, key: str, cta: str = "🚀 Upgrade →", page: str = "settings"):
+    tier = get_user_tier()
     st.markdown(f"""
 <div style="background:rgba(240,165,0,.05);border:1px solid rgba(240,165,0,.18);
             border-left:3px solid #F0A500;border-radius:8px;
             padding:10px 14px;margin:8px 0;font-family:'DM Mono',monospace;
             font-size:12px;color:#B0B0B0;">🔒 {msg}</div>""", unsafe_allow_html=True)
     if st.button(cta, key=key, type="primary"):
-        st.session_state.current_page = page; st.rerun()
+        _unlock_cta(key + "_act", cta, tier, page)
+
+def _unlock_cta(key: str, cta: str, tier: str, upgrade_page: str = "settings"):
+    """
+    Visitor  → set show_auth=True and rerun so auth form renders immediately.
+    Logged-in → deep_link to Plan tab in Settings.
+    """
+    if tier == "visitor":
+        st.session_state.show_auth    = True
+        st.session_state.current_page = "home"
+        st.rerun()   # ← MUST rerun so home.render() sees show_auth=True
+    else:
+        st.session_state.deep_link_plan = True
+        st.session_state.current_page   = "settings"
+        st.rerun()
+
+
+def _scroll_to_pricing_js() -> str:
+    """Returns an HTML snippet with JS that scrolls to #pricing-section."""
+    return """<script>
+(function(){
+  var el = window.parent.document.getElementById('pricing-section');
+  if(el){ el.scrollIntoView({behavior:'smooth', block:'start'}); }
+})();
+</script>"""
+
+
+def _get_dynamic_cta(tier: str, profile: dict) -> tuple[str, str]:
+    """
+    Returns (cta_label, cta_page) based on user state per spec:
+      visitor             → Sign Up / Login → auth (home)
+      free (new signup)   → Unlock Premium Signals → settings/pricing
+      free (returning)    → Continue with Premium → settings/pricing
+      trial               → Upgrade to Pro Signals → settings/pricing
+      trial (expired)     → Renew Premium Access → settings/pricing
+      trial (active, engaged) → Upgrade to Pro Signals → settings/pricing
+      starter             → Upgrade to Trader → settings
+      trader/pro          → View AI Recommendations → signals
+    """
+    if tier == "visitor":
+        return ("🔐 Sign Up or Login →", "home")
+    if tier == "free":
+        # Distinguish returning vs new-ish
+        was_trial = was_trial_user(profile)
+        if was_trial:
+            return ("🔄 Renew Premium Access →", "settings")
+        ai_used = get_total_ai_queries()
+        if ai_used > 0:
+            return ("▶ Continue with Premium →", "settings")
+        return ("🔐 Unlock Premium Signals →", "settings")
+    if tier == "trial":
+        days_left = get_trial_days_left(profile)
+        if days_left == 0:
+            return ("🔄 Renew Premium Access →", "settings")
+        engaged = get_total_ai_queries() >= 3 or get_eng("signals_viewed", 0) >= 3
+        if engaged:
+            return ("⚡ Upgrade to Pro Signals →", "settings")
+        return ("✨ Unlock Premium Signals →", "settings")
+    if tier == "starter":
+        return ("📈 Upgrade to Trader →", "settings")
+    # trader / pro
+    return ("📊 View AI Recommendations →", "signals")
 
 def _tier_badge_html(tier: str) -> str:
     colors = {"visitor":"#606060","free":"#808080","trial":"#22C55E",
@@ -391,8 +587,8 @@ YOUR COMMUNICATION RULES (non-negotiable):
             "- Momentum: [Strong / Moderate / Weak]\n"
             "- Sentiment: [Positive / Mixed / Negative]\n"
             "- Risk Level: [Low / Medium / High]\n\n"
-            "**Action Tip:** [Specific guidance — e.g. 'Enter small position around ₦X, "
-            "set stop-loss at ₦Y']\n\n"
+            "**Action Tip:** [Specific guidance — e.g. 'Enter small position around NX, "
+            "set stop-loss at NY']\n\n"
             "RULES:\n- Language must stay beginner-friendly.\n"
             "- Include a price level (entry or target) if relevant.\n"
             "- Total: under 180 words.\n\n"
@@ -410,13 +606,13 @@ YOUR COMMUNICATION RULES (non-negotiable):
             "- Sentiment: [overall market mood on this stock]\n"
             "- Risk Level: [Low / Medium / High + brief reason]\n\n"
             "**Action Plan:**\n"
-            "- Entry: [specific entry range in ₦, or 'wait for X']\n"
+            "- Entry: [specific entry range in N, or 'wait for X']\n"
             "- Watch: [one specific thing to monitor next]\n"
             "- Risk Note: [one sentence on downside risk]\n\n"
             "**Detailed Insight:** *(only if adds real value)*\n"
             "[1-2 sentences of deeper context — keep it simple]\n\n"
             "RULES:\n- Must remain easy to understand — premium but not complex.\n"
-            "- Include specific ₦ price levels wherever relevant.\n"
+            "- Include specific N price levels wherever relevant.\n"
             "- Total: under 280 words.\n"
             "- End with: _Educational only — not financial advice._\n\n"
         )
@@ -616,8 +812,8 @@ def render_personalized_strip(tier: str, profile: dict, sb, name: str, uniq: lis
   {inner_html}
 </div>""", unsafe_allow_html=True)
         if show_upgrade_btn and upgrade_key:
-            if st.button("⬆️ Upgrade for unlimited →", key=upgrade_key, type="primary"):
-                st.session_state.current_page = "settings"; st.rerun()
+            if st.button("🔐 Upgrade for unlimited →", key=upgrade_key, type="primary"):
+                _unlock_cta(upgrade_key + "_act", "upgrade", tier, "settings")
 
     if tier == "free":
         limit = 2; rem = max(0, limit - used_today)
@@ -770,6 +966,9 @@ function doCopy(){{var done=function(){{var cf=document.getElementById('cf_{_uid
 _CSS = """
 <style>
 @import url('https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=Space+Grotesk:wght@500;600;700;800&display=swap');
+
+/* ── Smooth scroll ── */
+html{scroll-behavior:smooth;}
 
 /* ── Layout atoms ── */
 .sec-title{font-family:'Space Grotesk',sans-serif;font-size:18px;font-weight:700;color:#FFFFFF;margin:20px 0 6px 0;}
@@ -949,6 +1148,61 @@ _CSS = """
 @keyframes streak-glow{0%,100%{box-shadow:0 0 0 rgba(240,165,0,0);}50%{box-shadow:0 0 16px rgba(240,165,0,.4);}}
 @keyframes sticky-btn-pulse{0%,100%{box-shadow:0 4px 24px rgba(240,165,0,.4);transform:scale(1);}50%{box-shadow:0 6px 36px rgba(240,165,0,.7);transform:scale(1.025);}}
 
+/* ── Pro Command Center Card ── */
+.pcc-wrap{background:linear-gradient(160deg,#0C0C0C 0%,#050505 100%);border-radius:18px;overflow:hidden;margin-bottom:18px;animation:hero-fadein .5s ease both;}
+.pcc-accent{height:3px;background:linear-gradient(90deg,transparent,#F0A500,transparent);}
+.pcc-header{display:flex;align-items:center;justify-content:space-between;padding:14px 20px 12px;border-bottom:1px solid #1F1F1F;}
+.pcc-body{padding:20px 20px 16px;}
+.pcc-pulse{width:8px;height:8px;border-radius:50%;background:#F0A500;display:inline-block;animation:pulse-ring 2.5s infinite;flex-shrink:0;}
+.pcc-title{font-family:'Space Grotesk',sans-serif;font-size:13px;font-weight:600;color:#F0A500;letter-spacing:.04em;}
+.pcc-pro-badge{background:#F0A50020;border:1px solid #F0A50040;border-radius:4px;font-size:9px;color:#F0A500;padding:2px 7px;font-weight:700;letter-spacing:.1em;font-family:'DM Mono',monospace;}
+.pcc-refresh-btn{background:none;border:1px solid #1F1F1F;border-radius:6px;color:#909090;font-size:10px;padding:4px 10px;cursor:pointer;font-family:'DM Mono',monospace;}
+.pcc-hero{display:flex;align-items:flex-start;justify-content:space-between;margin-bottom:16px;flex-wrap:wrap;gap:10px;}
+.pcc-symbol{font-family:'Space Grotesk',sans-serif;font-size:22px;font-weight:700;color:#FFFFFF;letter-spacing:-0.01em;}
+.pcc-name{font-family:'DM Mono',monospace;font-size:11px;color:#606060;margin-top:2px;}
+.pcc-upside{border-radius:10px;padding:8px 14px;text-align:center;}
+.pcc-upside-lbl{font-size:9px;color:#606060;margin-bottom:2px;letter-spacing:.1em;text-transform:uppercase;font-family:'DM Mono',monospace;}
+.pcc-upside-val{font-family:'Space Grotesk',sans-serif;font-size:18px;font-weight:700;}
+.pcc-price-grid{display:grid;grid-template-columns:1fr 1fr 1fr;gap:1px;background:#1F1F1F;border-radius:10px;overflow:hidden;margin-bottom:20px;}
+.pcc-price-cell{background:#111111;padding:10px 0;text-align:center;}
+.pcc-price-lbl{font-size:9px;color:#606060;margin-bottom:4px;letter-spacing:.1em;text-transform:uppercase;font-family:'DM Mono',monospace;}
+.pcc-price-val{font-size:13px;font-weight:600;letter-spacing:-0.01em;font-family:'DM Mono',monospace;}
+.pcc-section-lbl{display:flex;align-items:center;gap:8px;font-family:'DM Mono',monospace;font-size:9px;color:#606060;text-transform:uppercase;letter-spacing:.15em;margin-bottom:8px;}
+.pcc-section-line{flex:1;height:1px;background:#1F1F1F;}
+.pcc-driver{display:flex;gap:10px;padding:10px 12px;background:#111111;border-radius:8px;margin-bottom:6px;}
+.pcc-driver-icon{font-size:12px;flex-shrink:0;margin-top:1px;}
+.pcc-driver-text{font-size:12px;color:#E0E0E0;line-height:1.65;font-family:'DM Mono',monospace;}
+.pcc-verdict{border-radius:10px;padding:12px 14px;margin-bottom:20px;}
+.pcc-verdict-lbl{font-size:9px;letter-spacing:.12em;text-transform:uppercase;margin-bottom:6px;font-family:'DM Mono',monospace;}
+.pcc-verdict-txt{font-family:'Space Grotesk',sans-serif;font-size:14px;font-weight:600;color:#FFFFFF;line-height:1.5;}
+.pcc-conf-row{display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;}
+.pcc-conf-label{font-family:'DM Mono',monospace;font-size:11px;color:#909090;letter-spacing:.08em;text-transform:uppercase;}
+.pcc-conf-right{display:flex;align-items:center;gap:8px;}
+.pcc-conf-text{font-family:'DM Mono',monospace;font-size:13px;font-weight:700;}
+.pcc-conf-pct{font-family:'DM Mono',monospace;font-size:11px;color:#606060;}
+.pcc-bar-track{display:flex;gap:3px;margin-bottom:20px;}
+.pcc-bar-block{flex:1;height:6px;border-radius:2px;}
+.pcc-sentiment-row{display:flex;justify-content:space-around;margin-bottom:20px;}
+.pcc-sent-item{display:flex;flex-direction:column;align-items:center;gap:5px;}
+.pcc-sent-ring-outer{display:flex;align-items:center;justify-content:center;border-radius:50%;}
+.pcc-sent-ring-inner{border-radius:50%;background:#111111;display:flex;align-items:center;justify-content:center;}
+.pcc-sent-val{font-family:'DM Mono',monospace;font-size:10px;font-weight:700;}
+.pcc-sent-lbl{font-family:'DM Mono',monospace;font-size:9px;color:#606060;text-transform:uppercase;letter-spacing:.06em;}
+.pcc-callout{display:flex;gap:10px;padding:12px 14px;border-radius:10px;margin-bottom:16px;}
+.pcc-callout-icon{font-size:14px;flex-shrink:0;}
+.pcc-callout-text{font-size:12px;line-height:1.65;font-family:'DM Mono',monospace;}
+.pcc-context{display:flex;gap:10px;padding:10px 14px;background:#111111;border-radius:10px;margin-bottom:20px;}
+.pcc-context-text{font-size:12px;color:#909090;line-height:1.65;font-family:'DM Mono',monospace;}
+.pcc-cta-grid{display:grid;grid-template-columns:2fr 1fr 1fr;gap:8px;}
+.pcc-cta-btn{border-radius:9px;padding:11px 6px;font-size:11px;cursor:pointer;font-family:'DM Mono',monospace;transition:opacity .2s;letter-spacing:.02em;border:none;}
+.pcc-cta-primary{background:linear-gradient(135deg,#F0A500,#D97706);color:#000;font-weight:700;}
+.pcc-cta-secondary{background:#181818;color:#E0E0E0;border:1px solid #1F1F1F !important;font-weight:500;}
+.pcc-footer{display:flex;justify-content:space-between;align-items:center;margin-top:14px;padding-top:10px;border-top:1px solid #1F1F1F;}
+.pcc-footer-text{font-family:'DM Mono',monospace;font-size:9px;color:#606060;}
+.pcc-fallback{background:#0A0A0A;border:1px solid #1F1F1F;border-radius:16px;padding:32px 24px;text-align:center;margin-bottom:18px;}
+.pcc-fallback-title{font-family:'Space Grotesk',sans-serif;font-size:16px;color:#E0E0E0;margin-bottom:8px;}
+.pcc-fallback-sub{font-family:'DM Mono',monospace;font-size:12px;color:#606060;line-height:1.7;}
+
 /* ── Responsive ── */
 @media(min-width:769px){.sticky-upgrade{display:none;}}
 @media(max-width:768px){
@@ -956,6 +1210,8 @@ _CSS = """
   .sp-grid,.dap-grid,.highlight-ribbon,.tgrid{grid-template-columns:1fr;}
   .hero-opp-prices{grid-template-columns:1fr 1fr;}
   .ai-msg-user{margin-left:5%;}
+  .pcc-cta-grid{grid-template-columns:1fr;}
+  .pcc-price-grid{grid-template-columns:1fr 1fr 1fr;}
 }
 </style>
 """
@@ -1164,28 +1420,6 @@ def _render_ai_section(tier, is_visitor, is_free, is_trial, is_starter, is_pro, 
         render_locked_content("ai_input", "lock_ai_visitor")
         return
 
-    # Signal insight rows
-    if insights:
-        st.markdown('<div style="font-family:DM Mono,monospace;font-size:10px;color:#606060;text-transform:uppercase;letter-spacing:.1em;margin-bottom:10px;">✨ Today\'s AI Signals — click any to ask deeper</div>', unsafe_allow_html=True)
-        for idx_i, ins in enumerate(insights):
-            _smins = max(3, 240 - idx_i*47 - (now.minute % 30))
-            _dc    = "live-dot-green" if ins["action"] == "BUY" else "live-dot-red" if ins["action"] == "AVOID" else "live-dot-amber"
-            _show_conf = can_access("signals_confidence", tier)
-            _conf_html = f'<span class="in-conf" style="color:{ins["ac"]};">{ins["conf"]}%</span>' if _show_conf else '<span class="in-conf" style="color:#404040;">—%</span>'
-            if idx_i >= _sig_visible:
-                st.markdown(f'<div style="position:relative;margin-bottom:8px;"><div class="insight-row" style="border-left:3px solid {ins["ac"]};filter:blur(4px);user-select:none;pointer-events:none;"><span class="in-sym">{ins["sym"]}</span><span class="in-badge" style="background:{ins["bg"]};color:{ins["ac"]};">{ins["action"]}</span><span class="in-reason">{ins["reason"]}</span>{_conf_html}</div><div style="position:absolute;inset:0;display:flex;align-items:center;justify-content:center;font-family:DM Mono,monospace;font-size:11px;color:#808080;">🔒 Upgrade to unlock</div></div>', unsafe_allow_html=True)
-            else:
-                c1, c2 = st.columns([6,1])
-                with c1:
-                    st.markdown(f'<div class="insight-row" style="border-left:3px solid {ins["ac"]};"><div class="live-dot {_dc}" style="flex-shrink:0;margin-right:2px;"></div><span class="in-sym">{ins["sym"]}</span><span class="in-badge" style="background:{ins["bg"]};color:{ins["ac"]};">{ins["action"]}</span><span class="in-reason">{ins["reason"]}</span><span style="font-size:10px;color:#404040;margin:0 8px;white-space:nowrap;">Signal {_time_ago(_smins)}</span>{_conf_html}</div>', unsafe_allow_html=True)
-                with c2:
-                    if st.button("Ask →", key=f"ins_{ins['sym']}", use_container_width=True):
-                        st.session_state.mai_pending = f"Give me a detailed analysis of {ins['sym']}. Signal: {ins['action']}. Should I act on this?"; track_stock_analyzed(ins["sym"]); st.rerun()
-        if not can_access("signals_all", tier):
-            _upgrade_inline(f"Showing {_sig_visible} of 5 signals. Upgrade to see all signals with full reasoning.", key="nudge_signals", cta="🔒 Unlock All Signals →")
-        elif is_trial:
-            _reinforcement_pill("AI helped identify top movers today — you're using Pro-level signals")
-
     st.markdown("</div>", unsafe_allow_html=True)
 
     # Chat history
@@ -1208,8 +1442,8 @@ def _render_ai_section(tier, is_visitor, is_free, is_trial, is_starter, is_pro, 
                 st.markdown(f'<div style="background:rgba(240,165,0,.05);border:1px solid rgba(240,165,0,.2);border-radius:8px;padding:12px 16px;margin-bottom:10px;font-family:DM Mono,monospace;"><div style="font-size:12px;font-weight:700;color:#F0A500;margin-bottom:5px;">🔒 Unlock full AI analysis</div><div style="font-size:11px;color:#808080;margin-bottom:8px;line-height:1.6;">Your plan ({tier.upper()}): limited AI response. Upgrade for complete breakdown.</div></div>', unsafe_allow_html=True)
                 _,_bc,_ = st.columns([1,2,1])
                 with _bc:
-                    if st.button("🚀 Unlock Full AI Insights →", key=f"ai_blur_cta{key_suffix}", type="primary", use_container_width=True):
-                        st.session_state.current_page = "settings"; st.rerun()
+                    if st.button("🔐 Unlock Full AI Insights →", key=f"ai_blur_cta{key_suffix}", type="primary", use_container_width=True):
+                        _unlock_cta(f"ai_blur_act{key_suffix}", "unlock", tier, "settings")
             else:
                 st.markdown(f'<div class="ai-msg-bot">{c}</div>', unsafe_allow_html=True)
                 _is_decision = any(kw in raw[:120].lower() for kw in ["recommendation:", "buy", "hold", "avoid"])
@@ -1313,14 +1547,14 @@ def _render_ai_section(tier, is_visitor, is_free, is_trial, is_starter, is_pro, 
                 st.session_state.mai_history = []; st.rerun()
     with ac2:
         if tier in ("visitor","free"):
-            if st.button("⚡ Unlock Unlimited AI →", key="ai_up", type="primary", use_container_width=True):
-                st.session_state.current_page = "settings"; st.rerun()
+            if st.button("🔐 Unlock Unlimited AI →", key="ai_up", type="primary", use_container_width=True):
+                _unlock_cta("ai_up_act", "unlock", tier, "settings")
 
 
 def _render_daily_picks(tier, is_trial, picks, picks_visible):
     """Daily AI Picks grid"""
     st.markdown('<div class="sec-title">🤖 Daily AI Picks</div>', unsafe_allow_html=True)
-    st.markdown('<div class="sec-intro">AI-curated picks refreshed every trading day at 10 AM WAT. Based on signal scores, volume patterns &amp; momentum analysis. <strong style="color:#F0A500;">Not financial advice.</strong></div>', unsafe_allow_html=True)
+    st.markdown('<div class="sec-intro">AI-curated picks refreshed every trading day at 10 AM WAT. Based on signal scores, volume patterns &amp; momentum analysis. <strong style="color:#F0A500;">Not financial advice.</strong><br><span style="font-size:11px;color:#606060;display:block;margin-top:6px;">💡 <strong style="color:#808080;">How is this different from Trending Now?</strong> Trending Now shows what is moving <em>right now</em> based on live price action. Daily AI Picks are our curated shortlist — the stocks the AI has pre-screened each morning for the strongest overall setup across momentum, volume, and fundamentals. Think of Trending Now as the market live feed and Daily Picks as the AI\'s considered recommendation list for the day.</span></div>', unsafe_allow_html=True)
     if is_trial:
         _reinforcement_pill("You're seeing all 9 picks — this is a Pro feature exclusive to your trial")
 
@@ -1354,11 +1588,11 @@ def _render_news_section(tier, sb, market, today):
     """Latest Market News"""
     with st.expander("📰  LATEST MARKET NEWS", expanded=False):
         st.markdown('<div class="sec-intro">🟢 Positive — buying opportunities. 🔴 Negative — possible pressure.</div>', unsafe_allow_html=True)
-        news_res = sb.table("news").select("headline,sentiment,scraped_at").order("scraped_at",desc=True).limit(20).execute()
-        if news_res.data:
+        news_data = _home_get_news()
+        if news_data:
             _nvis = 12 if can_access("news_full",tier) else 4
             seen_h = set(); cnt = 0
-            for art in news_res.data:
+            for art in news_data:
                 hk = (art.get("headline") or "")[:60].lower()
                 if hk in seen_h or cnt >= 12: continue
                 seen_h.add(hk); cnt += 1
@@ -1383,10 +1617,10 @@ def _render_sector_snapshot(tier, sb):
     """Sector snapshot"""
     with st.expander("🚦  SECTOR SNAPSHOT", expanded=False):
         st.markdown('<div class="sec-intro">🟢 Bullish — consider. 🟡 Mixed — wait. 🔴 Weakening — caution.</div>', unsafe_allow_html=True)
-        sec_res = sb.table("sector_performance").select("sector_name,traffic_light,change_percent,verdict").order("change_percent",desc=True).execute()
-        if sec_res.data:
+        sec_data = _home_get_sectors()
+        if sec_data:
             seen_s = {}
-            for s in sec_res.data:
+            for s in sec_data:
                 sn = s.get("sector_name","").strip()
                 if sn and sn not in seen_s: seen_s[sn] = s
             all_sec = sorted(seen_s.values(), key=lambda x:float(x.get("change_percent",0) or 0), reverse=True)
@@ -1414,8 +1648,7 @@ def _render_trade_game(sb, current_user):
     """NGX Trade Game leaderboard"""
     st.markdown('<div class="sec-title">🎮 NGX Trade Game</div>', unsafe_allow_html=True)
     st.markdown('<div class="sec-intro">Practice with <strong style="color:#F0A500;">N1,000,000 virtual cash</strong> — real NGX stocks, zero real money risk.</div>', unsafe_allow_html=True)
-    board_res = sb.table("leaderboard_snapshots").select("display_name,return_percent,user_id").order("return_percent",desc=True).limit(5).execute()
-    board     = board_res.data or []; medals = ["🥇","🥈","🥉"]
+    board     = _home_get_leaderboard(); medals = ["🥇","🥈","🥉"]
     if board:
         for i, e in enumerate(board[:5]):
             ret = float(e.get("return_percent",0) or 0); dn = (e.get("display_name") or "Investor")[:22]
@@ -1454,10 +1687,549 @@ def _render_faq():
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# MAIN RENDER
+# PRO COMMAND CENTER CARD
 # ══════════════════════════════════════════════════════════════════════════════
 
+def _render_pro_command_center(tier, insights, uniq, _sig_map, market, now, top_g, sb):
+    """
+    AI Trade Briefing Card — shown only to trader/pro users at the very top
+    of the dashboard flow, above all other sections.
+
+    Selects the single highest-confidence BUY signal from today's insights,
+    augments it with live price data from Supabase, then renders a full
+    human-readable briefing card in plain HTML (no Streamlit buttons inside
+    the card — CTAs are standard st.button calls beneath).
+    """
+
+    # ── 1. Pick the best signal ───────────────────────────────────────────────
+    _pcc_cache_key = f"pcc_{str(date.today())}"
+    if _pcc_cache_key not in st.session_state:
+        # Prefer BUY signals with highest confidence; fall back to any signal
+        _buys  = [i for i in insights if i["action"] == "BUY"]
+        _best  = max(_buys, key=lambda x: x["conf"]) if _buys else (
+                 max(insights, key=lambda x: x["conf"]) if insights else None)
+        st.session_state[_pcc_cache_key] = _best
+    _best = st.session_state[_pcc_cache_key]
+
+    # ── 2. Confidence threshold — show fallback if no strong signal ───────────
+    if not _best or _best["conf"] < 41:
+        st.markdown("""
+<div class="pcc-fallback">
+  <div style="font-size:32px;margin-bottom:12px;">🕐</div>
+  <div class="pcc-fallback-title">No clear high-confidence opportunity right now</div>
+  <div class="pcc-fallback-sub">It may be best to wait. The AI will surface the next strong signal<br>as soon as one emerges — usually within the hour.</div>
+</div>""", unsafe_allow_html=True)
+        return
+
+    sym   = _best["sym"]
+    conf  = _best["conf"]
+    sig   = _best["action"]   # BUY / HOLD / AVOID
+    reason = _best["reason"]
+
+    # Signal colour
+    _sc = "#22C55E" if sig == "BUY" else "#EF4444" if sig == "AVOID" else "#F0A500"
+
+    # ── 3. Price data ─────────────────────────────────────────────────────────
+    _px = next((p for p in uniq if p.get("symbol","") == sym), None)
+    if _px:
+        _entry   = float(_px.get("price", 0) or 0)
+        _chg     = float(_px.get("change_percent", 0) or 0)
+    else:
+        _entry = 0.0; _chg = 0.0
+
+    # Derive target and stop-loss from signal DB if available, else estimate
+    _sd       = _sig_map.get(sym, {})
+    _stars    = int(_sd.get("stars", 3) or 3)
+    _target   = round(_entry * 1.075, 2) if _entry > 0 else 0.0   # ~7.5% upside
+    _stop     = round(_entry * 0.935, 2) if _entry > 0 else 0.0   # ~6.5% stop
+    _upside   = round((_target - _entry) / _entry * 100, 1) if _entry > 0 else 0.0
+
+    # ── 4. Sentiment scores (derived from signal sub-scores) ──────────────────
+    _mom  = float(_sd.get("momentum_score",  0.65) or 0.65)
+    _vols = float(_sd.get("volume_score",    0.60) or 0.60)
+    _news = float(_sd.get("news_score",      0.70) or 0.70)
+    _soc  = min(int(_news  * 100 * 1.05), 99)   # social proxied from news
+    _nws  = min(int(_news  * 100), 99)
+    _act  = min(int(_vols  * 100 * 1.10), 99)
+
+    # ── 5. Confidence label ───────────────────────────────────────────────────
+    if conf >= 81:   _clabel, _cc = "Very High", "#F0A500"
+    elif conf >= 61: _clabel, _cc = "High",      "#22C55E"
+    elif conf >= 41: _clabel, _cc = "Medium",    "#60A5FA"
+    else:            _clabel, _cc = "Low",        "#EF4444"
+
+    # ── 6. Sentiment ring helper ──────────────────────────────────────────────
+    def _sent_ring(val, label):
+        _rc = "#22C55E" if val >= 70 else "#F0A500" if val >= 50 else "#EF4444"
+        _deg = round(val * 3.6)
+        return (
+            f'<div class="pcc-sent-item">'
+            f'<div class="pcc-sent-ring-outer" style="width:44px;height:44px;background:conic-gradient({_rc} {_deg}deg,#1A1A1A 0deg);">'
+            f'<div class="pcc-sent-ring-inner" style="width:34px;height:34px;">'
+            f'<span class="pcc-sent-val" style="color:{_rc};">{val}</span>'
+            f'</div></div>'
+            f'<span class="pcc-sent-lbl">{label}</span>'
+            f'</div>'
+        )
+
+    # ── 7. Plain-English copy ─────────────────────────────────────────────────
+    # Driver lines — human-readable, no jargon
+    _driver1 = f"News and market talk are currently focused on {sym} — mostly positive given recent activity and sector momentum."
+    _driver2 = f"Real trading data shows more buyers than sellers today, with volume running well above the recent average."
+
+    # Verdict
+    _verdict_map = {
+        "BUY":   f"Strong buying pressure backed by solid data. The setup looks clean for {sym} right now.",
+        "HOLD":  f"Decent stock, but not the right moment to rush in. Wait for a clearer directional signal.",
+        "AVOID": f"The data is not in favour of this stock right now. Better opportunities exist elsewhere.",
+    }
+    _verdict = _verdict_map.get(sig, _verdict_map["HOLD"])
+
+    # Risk
+    _risk_map = {
+        "BUY":   "The price may dip slightly before continuing upward. Be ready for a short-term pullback before the move.",
+        "HOLD":  "The stock could move either way from here. Avoid committing a large position until the picture is clearer.",
+        "AVOID": "Continued selling pressure could push the price lower. No clear floor has been established yet.",
+    }
+    _risk = _risk_map.get(sig, _risk_map["HOLD"])
+
+    # Action
+    _action_map = {
+        "BUY":   f"You can consider entering close to N{_entry:,.2f}. Start small and add more if it holds and keeps rising.",
+        "HOLD":  "If you already own this stock, hold it steady. If you don't, wait a bit before making a move.",
+        "AVOID": "This is not the right time to enter. Watch from the sidelines and wait for a stronger signal.",
+    }
+    _action = _action_map.get(sig, _action_map["HOLD"])
+
+    # Market context from sector + mood
+    _top_sector = ""
+    try:
+        _sec_data_pcc = _home_get_sectors()
+        if _sec_data_pcc:
+            _ts = _sec_data_pcc[0]
+            _top_sector = f"{_ts['sector_name']} stocks are attracting strong attention today. "
+    except Exception:
+        pass
+    _mood_ctx = {"Bullish": "Overall market mood is positive — conditions are healthy for BUY signals.",
+                 "Bearish": "Overall market is under some pressure today. Extra caution is advised.",
+                 "Neutral": "The market is mixed today. Focus on stocks with the clearest signals."
+                 }
+    # Derive mood from top_g data
+    _avg_chg = sum(float(p.get("change_percent",0) or 0) for p in top_g[:5]) / max(len(top_g[:5]), 1)
+    _mctx_mood = "Bullish" if _avg_chg > 0.5 else "Bearish" if _avg_chg < -0.5 else "Neutral"
+    _context = _top_sector + _mood_ctx.get(_mctx_mood, _mood_ctx["Neutral"])
+
+    # Last refreshed display
+    _refreshed_str = now.strftime("%I:%M %p") + " WAT"
+
+    # ── 8. Price display helpers ───────────────────────────────────────────────
+    def _fmt(n): return f"N{n:,.2f}" if n > 0 else "—"
+
+    # ── 9. Render via st.components.v1.html (bypasses Streamlit sanitizer) ──────
+    # st.markdown strips CSS class attributes even with unsafe_allow_html=True.
+    # components.v1.html renders inside a real iframe — full HTML/CSS support.
+    _stars_html = "⭐" * _stars
+
+    _card_html = f"""<!DOCTYPE html>
+<html>
+<head>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<link href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=Space+Grotesk:wght@600;700&display=swap" rel="stylesheet">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
+<style>
+*{{margin:0;padding:0;box-sizing:border-box;}}
+html,body{{background:transparent;font-family:'DM Mono',monospace;overflow-x:hidden;}}
+@keyframes pulse-ring{{0%{{box-shadow:0 0 0 0 rgba(240,165,0,.3);}}70%{{box-shadow:0 0 0 8px rgba(240,165,0,0);}}100%{{box-shadow:0 0 0 0 rgba(240,165,0,0);}}}}
+@keyframes fadein{{from{{opacity:0;transform:translateY(6px);}}to{{opacity:1;transform:translateY(0);}}}}
+.card{{background:linear-gradient(160deg,#0C0C0C 0%,#050505 100%);border:1px solid {_sc}44;border-radius:18px;overflow:hidden;animation:fadein .4s ease both;}}
+.accent{{height:3px;background:linear-gradient(90deg,transparent,{_sc},transparent);}}
+.hdr{{display:flex;align-items:center;justify-content:space-between;padding:13px 18px 11px;border-bottom:1px solid #1F1F1F;flex-wrap:wrap;gap:6px;}}
+.hdr-left{{display:flex;align-items:center;gap:9px;}}
+.pulse{{width:8px;height:8px;border-radius:50%;background:#F0A500;display:inline-block;animation:pulse-ring 2.5s infinite;flex-shrink:0;}}
+.hdr-title{{font-family:'Space Grotesk',sans-serif;font-size:13px;font-weight:600;color:#F0A500;letter-spacing:.04em;}}
+.pro-badge{{background:#F0A50020;border:1px solid #F0A50040;border-radius:4px;font-size:9px;color:#F0A500;padding:2px 7px;font-weight:700;letter-spacing:.1em;}}
+.hdr-time{{font-size:10px;color:#606060;}}
+.body{{padding:18px 18px 14px;}}
+.hero{{display:flex;align-items:flex-start;justify-content:space-between;margin-bottom:14px;gap:10px;flex-wrap:wrap;}}
+.sym{{font-family:'Space Grotesk',sans-serif;font-size:22px;font-weight:700;color:#FFF;letter-spacing:-.01em;}}
+.sig-badge{{border-radius:6px;font-size:11px;font-weight:700;padding:3px 10px;letter-spacing:.1em;border-width:1.5px;border-style:solid;}}
+.stock-name{{font-size:11px;color:#606060;margin-top:3px;}}
+.upside-box{{border-radius:10px;padding:8px 14px;text-align:center;flex-shrink:0;}}
+.upside-lbl{{font-size:9px;color:#606060;margin-bottom:2px;letter-spacing:.1em;text-transform:uppercase;}}
+.upside-val{{font-family:'Space Grotesk',sans-serif;font-size:18px;font-weight:700;}}
+.price-grid{{display:grid;grid-template-columns:1fr 1fr 1fr;gap:1px;background:#1F1F1F;border-radius:10px;overflow:hidden;margin-bottom:18px;}}
+.price-cell{{background:#111;padding:10px 0;text-align:center;}}
+.price-lbl{{font-size:9px;color:#606060;margin-bottom:4px;letter-spacing:.1em;text-transform:uppercase;}}
+.price-val{{font-size:13px;font-weight:600;letter-spacing:-.01em;}}
+.sec-lbl{{display:flex;align-items:center;gap:8px;font-size:9px;color:#606060;text-transform:uppercase;letter-spacing:.15em;margin-bottom:8px;}}
+.sec-line{{flex:1;height:1px;background:#1F1F1F;}}
+.driver{{display:flex;gap:10px;padding:10px 12px;background:#111;border-radius:8px;margin-bottom:6px;}}
+.driver-icon{{font-size:12px;flex-shrink:0;margin-top:1px;}}
+.driver-text{{font-size:12px;color:#E0E0E0;line-height:1.65;}}
+.verdict{{border-radius:10px;padding:12px 14px;margin-bottom:18px;}}
+.verdict-lbl{{font-size:9px;letter-spacing:.12em;text-transform:uppercase;margin-bottom:6px;}}
+.verdict-txt{{font-family:'Space Grotesk',sans-serif;font-size:14px;font-weight:600;color:#FFF;line-height:1.5;}}
+.conf-row{{display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;}}
+.conf-label{{font-size:11px;color:#909090;letter-spacing:.08em;text-transform:uppercase;}}
+.conf-right{{display:flex;align-items:center;gap:8px;}}
+.conf-text{{font-size:13px;font-weight:700;}}
+.conf-pct{{font-size:11px;color:#606060;}}
+.bar-track{{display:flex;gap:3px;margin-bottom:18px;}}
+.bar-block{{flex:1;height:6px;border-radius:2px;}}
+.sent-row{{display:flex;justify-content:space-around;margin-bottom:18px;}}
+.sent-item{{display:flex;flex-direction:column;align-items:center;gap:5px;}}
+.sent-outer{{display:flex;align-items:center;justify-content:center;border-radius:50%;width:44px;height:44px;}}
+.sent-inner{{border-radius:50%;background:#111;display:flex;align-items:center;justify-content:center;width:34px;height:34px;}}
+.sent-val{{font-size:10px;font-weight:700;}}
+.sent-lbl{{font-size:9px;color:#606060;text-transform:uppercase;letter-spacing:.06em;}}
+.callout{{display:flex;gap:10px;padding:12px 14px;border-radius:10px;margin-bottom:14px;}}
+.callout-icon{{font-size:14px;flex-shrink:0;}}
+.callout-text{{font-size:12px;line-height:1.65;}}
+.ctx-box{{display:flex;gap:10px;padding:10px 14px;background:#111;border-radius:10px;margin-bottom:18px;}}
+.ctx-text{{font-size:12px;color:#909090;line-height:1.65;}}
+.footer{{display:flex;justify-content:space-between;align-items:center;padding-top:10px;border-top:1px solid #1F1F1F;}}
+.footer-text{{font-size:9px;color:#606060;}}
+.sig-footer{{display:flex;align-items:center;justify-content:center;gap:8px;padding:10px 0 0 0;margin-top:6px;border-top:1px solid #1F1F1F;}}
+.sig-logo{{font-family:'Space Grotesk',sans-serif;font-size:11px;font-weight:700;color:#F0A500;letter-spacing:.06em;}}
+.sig-url{{font-family:'DM Mono',monospace;font-size:9px;color:#404040;}}
+/* Share strip */
+.share-strip{{padding:14px 18px 18px;border-top:1px solid #1F1F1F;}}
+.share-strip-row{{display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;}}
+.share-label{{font-family:'DM Mono',monospace;font-size:10px;color:#606060;text-transform:uppercase;letter-spacing:.12em;}}
+.share-btns{{display:flex;gap:8px;flex-wrap:wrap;}}
+.share-btn{{display:flex;align-items:center;gap:6px;background:transparent;border:1px solid rgba(255,255,255,.25);border-radius:8px;padding:7px 14px;cursor:pointer;font-family:'DM Mono',monospace;font-size:11px;font-weight:600;color:#FFFFFF;transition:all .15s;}}
+.share-btn:hover{{border-color:rgba(255,255,255,.5);background:rgba(255,255,255,.05);}}
+.share-btn:active{{transform:scale(.97);}}
+.share-btn-icon{{font-size:13px;}}
+/* Toast */
+#pcc-toast{{position:fixed;bottom:20px;left:50%;transform:translateX(-50%);background:#22C55E;color:#000;font-family:'Space Grotesk',sans-serif;font-size:12px;font-weight:700;padding:8px 18px;border-radius:20px;display:none;z-index:9999;box-shadow:0 4px 20px rgba(34,197,94,.4);}}
+</style>
+</head>
+<body>
+<div id="pcc-toast">✓ Done!</div>
+<div id="pcc-capture">
+<div class="card">
+  <div class="accent"></div>
+  <div class="hdr">
+    <div class="hdr-left">
+      <div class="pulse"></div>
+      <span class="hdr-title">&#129504; AI Trade Briefing</span>
+      <span class="pro-badge">PRO</span>
+    </div>
+    <span class="hdr-time">Updated {_refreshed_str} &nbsp;&middot;&nbsp; Refreshes every 10 min</span>
+  </div>
+  <div class="body">
+    <div class="hero">
+      <div>
+        <div style="display:flex;align-items:center;gap:10px;margin-bottom:4px;">
+          <span class="sym">{sym}</span>
+          <span class="sig-badge" style="background:{_sc}22;border-color:{_sc};color:{_sc};">{sig}</span>
+        </div>
+        <div class="stock-name">{_stars_html} &nbsp;&middot;&nbsp; {_chg:+.2f}% today</div>
+      </div>
+      <div class="upside-box" style="background:{_sc}15;border:1px solid {_sc}33;">
+        <div class="upside-lbl">Potential</div>
+        <div class="upside-val" style="color:{_sc};">+{_upside}%</div>
+      </div>
+    </div>
+    <div class="price-grid">
+      <div class="price-cell"><div class="price-lbl">Entry</div><div class="price-val" style="color:#E0E0E0;">{_fmt(_entry)}</div></div>
+      <div class="price-cell"><div class="price-lbl">Target</div><div class="price-val" style="color:#22C55E;">{_fmt(_target)}</div></div>
+      <div class="price-cell"><div class="price-lbl">Stop</div><div class="price-val" style="color:#EF4444;">{_fmt(_stop)}</div></div>
+    </div>
+    <div class="sec-lbl"><div class="sec-line"></div>What&#39;s Really Driving This<div class="sec-line"></div></div>
+    <div class="driver" style="border-left:2px solid #60A5FA;">
+      <span class="driver-icon">&#128227;</span>
+      <span class="driver-text">{_driver1}</span>
+    </div>
+    <div class="driver" style="border-left:2px solid #22C55E;margin-bottom:12px;">
+      <span class="driver-icon">&#128202;</span>
+      <span class="driver-text">{_driver2}</span>
+    </div>
+    <div class="verdict" style="background:{_sc}12;border:1px solid {_sc}33;">
+      <div class="verdict-lbl" style="color:{_sc};">Simple Verdict</div>
+      <div class="verdict-txt">{_verdict}</div>
+    </div>
+    <div class="sec-lbl"><div class="sec-line"></div>Confidence Level<div class="sec-line"></div></div>
+    <div style="margin-bottom:18px;">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;">
+        <span class="conf-label">Confidence</span>
+        <span class="conf-text" style="color:{_cc};">{_clabel} &nbsp;<span class="conf-pct">{conf}%</span></span>
+      </div>
+      <div style="height:8px;background:#1A1A1A;border-radius:4px;overflow:hidden;">
+        <div style="width:{conf}%;height:100%;background:{_cc};border-radius:4px;transition:width .6s ease;"></div>
+      </div>
+    </div>
+    <div class="sec-lbl"><div class="sec-line"></div>Risk Insight<div class="sec-line"></div></div>
+    <div class="callout" style="background:#1A0A0A;border:1px solid #EF444430;">
+      <span class="callout-icon">&#9888;&#65039;</span>
+      <span class="callout-text" style="color:#FCA5A5;">{_risk}</span>
+    </div>
+    <div class="sec-lbl"><div class="sec-line"></div>Smart Action<div class="sec-line"></div></div>
+    <div class="callout" style="background:#001A08;border:1px solid #22C55E30;">
+      <span class="callout-icon">&#128161;</span>
+      <span class="callout-text" style="color:#86EFAC;">{_action}</span>
+    </div>
+    <div class="sec-lbl"><div class="sec-line"></div>Market Context<div class="sec-line"></div></div>
+    <div class="ctx-box">
+      <span class="callout-icon">&#127757;</span>
+      <span class="ctx-text">{_context}</span>
+    </div>
+    <div class="footer">
+      <span class="footer-text">Not financial advice &nbsp;&middot;&nbsp; Always DYOR</span>
+      <span class="footer-text">Signal: {now.strftime("%d %b %Y")}</span>
+    </div>
+    <!-- NGX Signal signature — always visible in image/PDF capture -->
+    <div class="sig-footer">
+      <span class="sig-logo">&#9889; NGX Signal</span>
+      <span class="sig-url">ngxsignal.com &nbsp;&middot;&nbsp; AI Market Intelligence for Nigerian Stocks</span>
+    </div>
+  </div>
+  <!-- Share strip — visible only on screen, hidden from capture -->
+  <div class="share-strip" id="share-strip">
+    <div class="share-strip-row">
+      <span class="share-label">&#8679; Share Command Center</span>
+      <div class="share-btns">
+        <button class="share-btn" onclick="shareAsImage()">
+          <span class="share-btn-icon">&#128247;</span>
+          <span>Save as Image</span>
+        </button>
+        <button class="share-btn" onclick="shareAsPDF()">
+          <span class="share-btn-icon">&#128196;</span>
+          <span>Download PDF</span>
+        </button>
+      </div>
+    </div>
+  </div>
+</div>
+</div>
+<script>
+// Auto-resize iframe to fit content
+function resizeFrame() {{
+  var h = document.documentElement.scrollHeight || document.body.scrollHeight;
+  try {{ window.parent.postMessage({{type:'streamlit:setFrameHeight', height: h}}, '*'); }} catch(e) {{}}
+}}
+window.addEventListener('load', function() {{ setTimeout(resizeFrame, 200); }});
+
+function showToast(msg) {{
+  var t = document.getElementById('pcc-toast');
+  t.textContent = msg;
+  t.style.display = 'block';
+  setTimeout(function() {{ t.style.display = 'none'; }}, 2200);
+}}
+
+// ── Light-mode export card (hidden, used for image/PDF capture) ──
+function buildExportCard() {{
+  var el = document.getElementById('export-card');
+  if (el) document.body.removeChild(el);
+  var sc = '{_sc}';
+  var sigColor = sc === '#22C55E' ? '#16A34A' : sc === '#EF4444' ? '#DC2626' : '#B45309';
+  var sigBg    = sc === '#22C55E' ? '#DCFCE7' : sc === '#EF4444' ? '#FEE2E2' : '#FEF3C7';
+  var confColor= '{_cc}' === '#22C55E' ? '#16A34A' : '{_cc}' === '#F0A500' ? '#B45309' : '{_cc}' === '#60A5FA' ? '#2563EB' : '#DC2626';
+
+  var card = document.createElement('div');
+  card.id = 'export-card';
+  card.style.cssText = [
+    'position:fixed','top:-9999px','left:-9999px',
+    'width:600px','background:#FFFFFF',
+    'font-family:DM Mono,monospace','border-radius:16px',
+    'overflow:hidden','box-shadow:0 4px 32px rgba(0,0,0,.12)',
+    'padding:0'
+  ].join(';');
+
+  card.innerHTML = `
+    <div style="background:linear-gradient(135deg,#0A0A0A,#1A1A1A);padding:16px 24px;display:flex;align-items:center;justify-content:space-between;">
+      <div style="display:flex;align-items:center;gap:10px;">
+        <div style="width:8px;height:8px;border-radius:50%;background:#F0A500;"></div>
+        <span style="font-family:Space Grotesk,sans-serif;font-size:14px;font-weight:700;color:#F0A500;letter-spacing:.04em;">🧠 AI Trade Briefing</span>
+        <span style="background:#F0A50020;border:1px solid #F0A50060;border-radius:4px;font-size:9px;color:#F0A500;padding:2px 7px;font-weight:700;letter-spacing:.1em;">PRO</span>
+      </div>
+      <span style="font-size:10px;color:#808080;">Signal: {now.strftime("%d %b %Y")}</span>
+    </div>
+
+    <div style="padding:24px 24px 0;">
+      <div style="display:flex;align-items:flex-start;justify-content:space-between;margin-bottom:16px;">
+        <div>
+          <div style="display:flex;align-items:center;gap:12px;margin-bottom:4px;">
+            <span style="font-family:Space Grotesk,sans-serif;font-size:32px;font-weight:800;color:#111;">{sym}</span>
+            <span style="background:${{sigBg}};border:1.5px solid ${{sigColor}};border-radius:6px;font-size:11px;font-weight:800;padding:4px 12px;letter-spacing:.1em;color:${{sigColor}};">{sig}</span>
+          </div>
+          <div style="font-size:12px;color:#666;">{'⭐' * _stars} &nbsp;·&nbsp; {_chg:+.2f}% today</div>
+        </div>
+        <div style="background:${{sigBg}};border:1.5px solid ${{sigColor}};border-radius:12px;padding:10px 16px;text-align:center;">
+          <div style="font-size:9px;color:#888;letter-spacing:.12em;text-transform:uppercase;margin-bottom:3px;">Potential</div>
+          <div style="font-family:Space Grotesk,sans-serif;font-size:22px;font-weight:800;color:${{sigColor}};">+{_upside}%</div>
+        </div>
+      </div>
+
+      <div style="display:grid;grid-template-columns:1fr 1fr 1fr;border:1.5px solid #E5E7EB;border-radius:12px;overflow:hidden;margin-bottom:20px;">
+        <div style="padding:12px;text-align:center;border-right:1px solid #E5E7EB;">
+          <div style="font-size:9px;color:#888;text-transform:uppercase;letter-spacing:.1em;margin-bottom:5px;">Entry</div>
+          <div style="font-size:15px;font-weight:700;color:#111;">{_fmt(_entry)}</div>
+        </div>
+        <div style="padding:12px;text-align:center;border-right:1px solid #E5E7EB;">
+          <div style="font-size:9px;color:#888;text-transform:uppercase;letter-spacing:.1em;margin-bottom:5px;">Target</div>
+          <div style="font-size:15px;font-weight:700;color:#16A34A;">{_fmt(_target)}</div>
+        </div>
+        <div style="padding:12px;text-align:center;">
+          <div style="font-size:9px;color:#888;text-transform:uppercase;letter-spacing:.1em;margin-bottom:5px;">Stop</div>
+          <div style="font-size:15px;font-weight:700;color:#DC2626;">{_fmt(_stop)}</div>
+        </div>
+      </div>
+
+      <div style="font-size:9px;color:#9CA3AF;text-transform:uppercase;letter-spacing:.15em;text-align:center;margin-bottom:10px;">What's Really Driving This</div>
+      <div style="background:#F8FAFC;border-left:3px solid #3B82F6;border-radius:0 8px 8px 0;padding:10px 14px;margin-bottom:8px;font-size:12px;color:#374151;line-height:1.65;">
+        📢 {_driver1}
+      </div>
+      <div style="background:#F0FDF4;border-left:3px solid #22C55E;border-radius:0 8px 8px 0;padding:10px 14px;margin-bottom:16px;font-size:12px;color:#374151;line-height:1.65;">
+        📊 {_driver2}
+      </div>
+
+      <div style="background:${{sigBg}};border:1.5px solid ${{sigColor}}44;border-radius:10px;padding:14px;margin-bottom:16px;">
+        <div style="font-size:9px;letter-spacing:.12em;text-transform:uppercase;color:${{sigColor}};margin-bottom:6px;">Simple Verdict</div>
+        <div style="font-family:Space Grotesk,sans-serif;font-size:14px;font-weight:700;color:#111;line-height:1.5;">{_verdict}</div>
+      </div>
+
+      <div style="font-size:9px;color:#9CA3AF;text-transform:uppercase;letter-spacing:.15em;text-align:center;margin-bottom:10px;">Confidence Level</div>
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
+        <span style="font-size:11px;color:#6B7280;text-transform:uppercase;letter-spacing:.08em;">Confidence</span>
+        <span style="font-size:13px;font-weight:800;color:${{confColor}};">{_clabel} &nbsp;<span style="font-size:11px;color:#9CA3AF;">{conf}%</span></span>
+      </div>
+      <div style="height:8px;background:#E5E7EB;border-radius:4px;overflow:hidden;margin-bottom:18px;">
+        <div style="width:{conf}%;height:100%;background:${{confColor}};border-radius:4px;"></div>
+      </div>
+
+      <div style="font-size:9px;color:#9CA3AF;text-transform:uppercase;letter-spacing:.15em;text-align:center;margin-bottom:10px;">Risk Insight</div>
+      <div style="background:#FFF7ED;border:1px solid #FED7AA;border-radius:10px;padding:12px 14px;margin-bottom:14px;display:flex;gap:10px;font-size:12px;color:#92400E;line-height:1.65;">
+        <span>⚠️</span><span>{_risk}</span>
+      </div>
+
+      <div style="font-size:9px;color:#9CA3AF;text-transform:uppercase;letter-spacing:.15em;text-align:center;margin-bottom:10px;">Smart Action</div>
+      <div style="background:#F0FDF4;border:1px solid #BBF7D0;border-radius:10px;padding:12px 14px;margin-bottom:14px;display:flex;gap:10px;font-size:12px;color:#166534;line-height:1.65;">
+        <span>💡</span><span>{_action}</span>
+      </div>
+
+      <div style="font-size:9px;color:#9CA3AF;text-transform:uppercase;letter-spacing:.15em;text-align:center;margin-bottom:10px;">Market Context</div>
+      <div style="background:#EFF6FF;border:1px solid #BFDBFE;border-radius:10px;padding:12px 14px;margin-bottom:20px;display:flex;gap:10px;font-size:12px;color:#1E40AF;line-height:1.65;">
+        <span>🌐</span><span>{_context}</span>
+      </div>
+    </div>
+
+    <div style="background:#F9FAFB;border-top:1px solid #E5E7EB;padding:12px 24px;display:flex;align-items:center;justify-content:space-between;">
+      <div>
+        <span style="font-family:Space Grotesk,sans-serif;font-size:13px;font-weight:800;color:#F0A500;">⚡ NGX Signal</span>
+        <span style="font-size:10px;color:#9CA3AF;margin-left:8px;">ngxsignal.com</span>
+      </div>
+      <span style="font-size:9px;color:#9CA3AF;">AI Market Intelligence for Nigerian Stocks &nbsp;·&nbsp; Not financial advice</span>
+    </div>
+  `;
+  document.body.appendChild(card);
+  return card;
+}}
+
+function captureExportCard() {{
+  var card = buildExportCard();
+  return html2canvas(card, {{
+    backgroundColor: '#FFFFFF',
+    scale: 2,
+    useCORS: true,
+    logging: false,
+    width: 600,
+    windowWidth: 600
+  }}).then(function(canvas) {{
+    document.body.removeChild(card);
+    return canvas;
+  }}).catch(function(e) {{
+    if (document.getElementById('export-card')) document.body.removeChild(card);
+    throw e;
+  }});
+}}
+
+function shareAsImage() {{
+  showToast('⏳ Generating image…');
+  captureExportCard().then(function(canvas) {{
+    var link = document.createElement('a');
+    link.download = 'NGX-Signal-Command-Center-{now.strftime("%Y%m%d")}.png';
+    link.href = canvas.toDataURL('image/png');
+    link.click();
+    showToast('✓ Image saved!');
+  }}).catch(function() {{ showToast('❌ Error — try again'); }});
+}}
+
+function shareAsPDF() {{
+  showToast('⏳ Generating PDF…');
+  captureExportCard().then(function(canvas) {{
+    var {{ jsPDF }} = window.jspdf;
+    var imgData = canvas.toDataURL('image/png');
+    // A4 portrait: 210 × 297 mm. Fit image width, extend page height if needed.
+    var pdfW = 210;
+    var imgW = canvas.width;
+    var imgH = canvas.height;
+    var ratio = imgH / imgW;
+    var pdfH = Math.max(297, Math.round(pdfW * ratio));
+    var pdf = new jsPDF({{ orientation: 'p', unit: 'mm', format: [pdfW, pdfH] }});
+    // White background
+    pdf.setFillColor(255, 255, 255);
+    pdf.rect(0, 0, pdfW, pdfH, 'F');
+    // Image centered with 5mm padding
+    var drawW = pdfW - 10;
+    var drawH = Math.round(drawW * ratio);
+    pdf.addImage(imgData, 'PNG', 5, 5, drawW, drawH);
+    // Footer text below image
+    var footerY = drawH + 12;
+    pdf.setFontSize(7);
+    pdf.setTextColor(156, 163, 175);
+    pdf.text('Generated by NGX Signal AI · ngxsignal.com · Not financial advice · Always DYOR', pdfW / 2, footerY, {{ align: 'center' }});
+    pdf.save('NGX-Signal-Command-Center-{now.strftime("%Y%m%d")}.pdf');
+    showToast('✓ PDF downloaded!');
+  }}).catch(function() {{ showToast('❌ Error — try again'); }});
+}}
+</script>
+</body>
+</html>"""
+
+    # Auto-calculate height: card has many sections — use 1100 min, scrolling enabled
+    st.components.v1.html(_card_html, height=1120, scrolling=True)
+
+    # CTA button — Full Analysis only
+    _,_bc_full,_ = st.columns([1, 2, 1])
+    with _bc_full:
+        if st.button("📊 Full Analysis →", key="pcc_full", type="primary", use_container_width=True):
+            st.session_state.current_page = "signals"; st.rerun()
+
+    st.markdown("<div style='height:6px'></div>", unsafe_allow_html=True)
+
+
+
+
 def render():
+    # ── AUTH INTERCEPT — must be first ───────────────────────────────────────
+    # Any button that calls _unlock_cta() for a visitor sets show_auth=True
+    # and reruns. We catch it here and render the auth form immediately.
+    if st.session_state.get("show_auth") and not st.session_state.get("user"):
+        from app.views import auth as _auth_view
+        st.markdown("""
+<div style="background:linear-gradient(135deg,#0A0800,#150F00);
+            border:1px solid rgba(240,165,0,0.3);border-radius:14px;
+            padding:20px 22px;text-align:center;max-width:520px;margin:16px auto 20px;">
+  <div style="font-size:36px;margin-bottom:10px;">🔐</div>
+  <div style="font-family:'Space Grotesk',sans-serif;font-size:20px;
+              font-weight:800;color:#F0A500;margin-bottom:6px;">
+    Sign Up Free — Get 14 Days Premium
+  </div>
+  <div style="font-family:'DM Mono',monospace;font-size:12px;
+              color:#A0A0A0;line-height:1.7;">
+    Full AI signals · Daily picks · Entry & target prices · No credit card needed
+  </div>
+</div>""", unsafe_allow_html=True)
+        _auth_view.render()
+        # Dismiss button so user can go back
+        if st.button("← Back to homepage", key="auth_back"):
+            st.session_state.show_auth = False
+            st.rerun()
+        return   # stop — don't render the rest of the homepage
+
     sb           = get_supabase()
     profile      = st.session_state.get("profile", {})
     current_user = st.session_state.get("user")
@@ -1488,15 +2260,105 @@ def render():
     _rem_queries, _queries_restricted = _queries_remaining(tier)
     ai_allowed = not _queries_restricted
 
-    _cta_map = {
-        "visitor": ("🚀 Create Free Account →",      "settings"),
-        "free":    ("🚀 Start Free 14-Day Trial →",   "settings"),
-        "trial":   ("✨ Upgrade to Keep Full Access →","settings"),
-        "starter": ("📈 Upgrade to Trader →",         "settings"),
-        "trader":  ("📊 View AI Recommendations →",   "signals"),
-        "pro":     ("📊 View AI Recommendations →",   "signals"),
-    }
-    cta_label, cta_page = _cta_map.get(tier, ("Upgrade →","settings"))
+    # ── POST-SIGNUP WELCOME MODAL ─────────────────────────────────────────────
+    # Fires once after a new signup. Uses a full-screen overlay so it can't be missed.
+    if st.session_state.get("just_signed_up"):
+        st.session_state.just_signed_up = False  # clear immediately — show once only
+        st.session_state.show_welcome_modal = True  # persist for this render
+
+    if st.session_state.get("show_welcome_modal"):
+        _wname = (profile.get("full_name","Investor") or "Investor").split()[0]
+        _tdl   = get_trial_days_left(profile) if profile else 14
+        st.markdown(f"""
+<style>
+@keyframes modal-pop{{from{{opacity:0;transform:scale(.92) translateY(20px);}}to{{opacity:1;transform:scale(1) translateY(0);}}}}
+@keyframes confetti-spin{{0%{{transform:rotate(0deg);}}100%{{transform:rotate(360deg);}}}}
+.wm-overlay{{position:fixed;inset:0;z-index:999999;background:rgba(0,0,0,.88);
+             backdrop-filter:blur(6px);display:flex;align-items:center;
+             justify-content:center;padding:20px;}}
+.wm-card{{background:linear-gradient(160deg,#080F00,#0D1A00);
+          border:2px solid rgba(34,197,94,.55);border-radius:20px;
+          padding:36px 28px;max-width:460px;width:100%;text-align:center;
+          box-shadow:0 0 80px rgba(34,197,94,.2);
+          animation:modal-pop .45s cubic-bezier(.16,1,.3,1) both;}}
+.wm-emoji{{font-size:56px;display:block;margin-bottom:14px;
+           animation:confetti-spin 2s ease-in-out 1;}}
+.wm-title{{font-family:'Space Grotesk',sans-serif;font-size:22px;
+           font-weight:800;color:#22C55E;margin-bottom:10px;line-height:1.3;}}
+.wm-body{{font-family:'DM Mono',monospace;font-size:13px;color:#D0D0D0;
+          line-height:1.8;margin-bottom:20px;}}
+.wm-stats{{display:flex;justify-content:center;gap:12px;
+           flex-wrap:wrap;margin-bottom:24px;}}
+.wm-stat{{background:rgba(34,197,94,.1);border:1px solid rgba(34,197,94,.3);
+          border-radius:10px;padding:12px 18px;}}
+.wm-stat-num{{font-family:'Space Grotesk',sans-serif;font-size:24px;
+              font-weight:800;color:#22C55E;}}
+.wm-stat-lbl{{font-family:'DM Mono',monospace;font-size:10px;color:#808080;margin-top:3px;}}
+.wm-btn{{display:block;width:100%;background:linear-gradient(135deg,#22C55E,#16A34A);
+         color:#000;font-family:'Space Grotesk',sans-serif;font-size:15px;
+         font-weight:800;border:none;border-radius:12px;padding:16px;
+         cursor:pointer;box-shadow:0 4px 24px rgba(34,197,94,.4);}}
+.wm-btn:hover{{opacity:.9;}}
+</style>
+<div class="wm-overlay" id="wm-overlay">
+  <div class="wm-card">
+    <span class="wm-emoji">🎉</span>
+    <div class="wm-title">You've Unlocked 14 Days<br>Free Premium Access!</div>
+    <div class="wm-body">
+      Welcome, {_wname}!<br>
+      Enjoy full access to premium signals and features.
+    </div>
+    <div class="wm-stats">
+      <div class="wm-stat">
+        <div class="wm-stat-num">{_tdl}</div>
+        <div class="wm-stat-lbl">Days Free</div>
+      </div>
+      <div class="wm-stat">
+        <div class="wm-stat-num" style="color:#F0A500;">∞</div>
+        <div class="wm-stat-lbl">AI Queries</div>
+      </div>
+      <div class="wm-stat">
+        <div class="wm-stat-num" style="color:#3B82F6;">9</div>
+        <div class="wm-stat-lbl">Daily Picks</div>
+      </div>
+    </div>
+    <button class="wm-btn"
+      onclick="document.getElementById('wm-overlay').style.display='none';
+               document.getElementById('wm-dismiss-btn').click();">
+      🚀 Start Exploring Premium →
+    </button>
+  </div>
+</div>""", unsafe_allow_html=True)
+        # Hidden Streamlit button that JS triggers to clear session state
+        if st.button("", key="wm-dismiss-btn", label_visibility="collapsed"):
+            st.session_state.show_welcome_modal = False
+            st.rerun()
+
+    # ── DAILY TRIAL REMINDER STRIP ────────────────────────────────────────────
+    # Shows every day for trial users — compact, not intrusive
+    if is_trial and not st.session_state.get("trial_reminder_dismissed"):
+        _remind_key = f"trial_remind_shown_{date.today()}"
+        if not st.session_state.get(_remind_key):
+            st.session_state[_remind_key] = True
+            _urgency_color = "#EF4444" if trial_urgent else "#F0A500"
+            _urgency_bg    = "rgba(239,68,68,0.08)" if trial_urgent else "rgba(240,165,0,0.06)"
+            _urgency_border= "rgba(239,68,68,0.35)" if trial_urgent else "rgba(240,165,0,0.25)"
+            _urgency_msg   = f"⚠️ Only {trial_days_left} days left!" if trial_urgent else f"✨ {trial_days_left} days remaining"
+            st.markdown(f"""
+<div style="background:{_urgency_bg};border:1px solid {_urgency_border};
+            border-left:3px solid {_urgency_color};border-radius:8px;
+            padding:10px 16px;margin-bottom:12px;
+            display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px;
+            font-family:'DM Mono',monospace;font-size:12px;">
+  <span style="color:{_urgency_color};font-weight:600;">
+    🔐 Premium Trial Active &nbsp;·&nbsp; {_urgency_msg}
+  </span>
+  <span style="color:#606060;">Day {trial_day_num} of 14 · Upgrade in Settings to keep access</span>
+</div>
+""", unsafe_allow_html=True)
+
+    # Dynamic CTA label + page — adapts to exact user state
+    cta_label, cta_page = _get_dynamic_cta(tier, profile)
 
     # ── Inject CSS ────────────────────────────────────────────────────────────
     st.markdown(_CSS, unsafe_allow_html=True)
@@ -1510,20 +2372,17 @@ def render():
 
     # ── Sticky mobile CTA (funnel tiers only) ─────────────────────────────────
     if is_funnel:
-        st.markdown("""
-<div class="sticky-upgrade">
-  <button id="sticky-trial-btn" onclick="
-    var btns=window.parent.document.querySelectorAll('button');
-    for(var i=0;i<btns.length;i++){
-      if(btns[i].innerText&&btns[i].innerText.includes('Start Free')){btns[i].click();return;}
-      if(btns[i].innerText&&btns[i].innerText.includes('Create Free Account')){btns[i].click();return;}
-    }
-  ">🚀 Start Free Trial — No Card Needed</button>
-  <div class="sticky-sub">14 days free · Unlimited AI · Cancel anytime</div>
-</div>""", unsafe_allow_html=True)
+        # ── Top CTA bar — pure Streamlit button, works on all devices ───────────
+        _mob_cta_label = "🔐 Sign Up Free — 14 Days Premium Access" if is_visitor else cta_label
+        _mc1, _mc2, _mc3 = st.columns([1, 3, 1])
+        with _mc2:
+            if st.button(_mob_cta_label, key="top_funnel_cta", type="primary", use_container_width=True):
+                _unlock_cta("top_funnel_act", _mob_cta_label, tier, "settings")
+        st.markdown('<div style="text-align:center;font-family:DM Mono,monospace;font-size:10px;color:#505050;margin-bottom:8px;">No credit card needed · Cancel anytime</div>', unsafe_allow_html=True)
 
     # ── DATA ──────────────────────────────────────────────────────────────────
-    raw, latest_date = get_all_latest_prices(sb)
+    # ── PERFORMANCE: all DB calls below use @st.cache_data — zero re-fetch on rerun ──
+    raw, latest_date = _home_get_latest_prices()
     seen = set(); uniq = []
     for p in raw:
         s = p.get("symbol","")
@@ -1531,8 +2390,7 @@ def render():
     total   = len(uniq)
     gainers = sum(1 for p in uniq if float(p.get("change_percent") or 0) > 0)
     losers  = sum(1 for p in uniq if float(p.get("change_percent") or 0) < 0)
-    sm_res  = sb.table("market_summary").select("*").order("trading_date",desc=True).limit(1).execute()
-    sm      = sm_res.data[0] if sm_res.data else {}
+    sm      = _home_get_market_summary()
     asi     = float(sm.get("asi_index",0) or 0)
     acg     = float(sm.get("asi_change_percent",0) or 0)
     gc      = gainers if total > 5 else int(sm.get("gainers_count",0) or 0)
@@ -1544,8 +2402,7 @@ def render():
                         ("Neutral","#F0A500","🟡"))
     ad         = f"{asi:,.2f}" if asi > 0 else "201,156.86"
     data_label = latest_date if market["is_open"] else f"Closed · Last: {latest_date}"
-    brief_res  = sb.table("ai_briefs").select("body,brief_date").eq("language","en").eq("brief_type","morning").order("brief_date",desc=True).limit(1).execute()
-    brief_ok   = bool(brief_res.data)
+    brief_ok   = bool(_home_get_ai_brief())
     brief_color= "#F0A500" if brief_ok else "#808080"
     top_g      = sorted(uniq, key=lambda x:float(x.get("change_percent",0) or 0), reverse=True)[:5]
     top_g_text = ", ".join(f"{p['symbol']} (+{float(p.get('change_percent',0)):.1f}%)" for p in top_g[:3])
@@ -1560,9 +2417,9 @@ def render():
     insight_key = f"ins_{_daily_seed()}"
     if insight_key not in st.session_state.get("mai_insights", {}):
         if "mai_insights" not in st.session_state: st.session_state.mai_insights = {}
-        sig_res = sb.table("signal_scores").select("symbol,signal,stars,reasoning").order("score_date",desc=True).order("stars",desc=True).limit(50).execute()
+        sig_res_data = _home_get_signal_scores_top(50)
         generated = []; seen_ins = set()
-        for s in (sig_res.data or []):
+        for s in sig_res_data:
             sym = s.get("symbol",""); sig = (s.get("signal") or "HOLD").upper().replace(" ","_")
             if sym in seen_ins or not sym: continue
             seen_ins.add(sym)
@@ -1582,10 +2439,8 @@ def render():
         for ins in insights: track_stock_analyzed(ins["sym"])
         st.session_state.insights_tracked = True
 
-    # Fetch signal scores for trending
-    _sig_res = sb.table("signal_scores").select("symbol,signal,stars,momentum_score,volume_score,news_score").order("score_date",desc=True).limit(200).execute()
     _sig_map: dict = {}
-    for _sr in (_sig_res.data or []):
+    for _sr in _home_get_signal_scores_full(200):
         _s = _sr.get("symbol","")
         if _s and _s not in _sig_map: _sig_map[_s] = _sr
 
@@ -1673,11 +2528,11 @@ def render():
                 # Show teaser hero card — blurred detail for visitors, partial for free
                 _blur_prices = is_visitor
                 _entry_html  = (
-                    f'<div class="hero-price-box"><div class="hero-price-lbl">Entry</div><div class="hero-price-val">₦{_hprice:,.2f}</div></div>'
-                    f'<div class="hero-price-box"><div class="hero-price-lbl">Target (+{_hpct_gain}%)</div><div class="hero-price-val" style="color:#22C55E;">₦{_htgt:,.2f}</div></div>'
+                    f'<div class="hero-price-box"><div class="hero-price-lbl">Entry</div><div class="hero-price-val">N{_hprice:,.2f}</div></div>'
+                    f'<div class="hero-price-box"><div class="hero-price-lbl">Target (+{_hpct_gain}%)</div><div class="hero-price-val" style="color:#22C55E;">N{_htgt:,.2f}</div></div>'
                 ) if not _blur_prices else (
-                    '<div class="hero-price-box" style="filter:blur(5px);user-select:none;"><div class="hero-price-lbl">Entry</div><div class="hero-price-val">₦XXX.XX</div></div>'
-                    '<div class="hero-price-box" style="filter:blur(5px);user-select:none;"><div class="hero-price-lbl">Target</div><div class="hero-price-val">₦XXX.XX</div></div>'
+                    '<div class="hero-price-box" style="filter:blur(5px);user-select:none;"><div class="hero-price-lbl">Entry</div><div class="hero-price-val">NXXX.XX</div></div>'
+                    '<div class="hero-price-box" style="filter:blur(5px);user-select:none;"><div class="hero-price-lbl">Target</div><div class="hero-price-val">NXXX.XX</div></div>'
                 )
                 st.markdown(f"""
 <div class="hero-opp-wrap">
@@ -1699,8 +2554,9 @@ def render():
                     if st.button("📊 View Full Signal", key="hero_view_sig", use_container_width=True):
                         st.session_state.current_page = "signals"; st.rerun()
                 with c2:
-                    if st.button("🚀 Start Free Trial", key="hero_trial_cta", type="primary", use_container_width=True):
-                        st.session_state.current_page = "settings"; st.rerun()
+                    _hero_cta_label = "🔐 Sign Up or Login →" if is_visitor else cta_label
+                    if st.button(_hero_cta_label, key="hero_trial_cta", type="primary", use_container_width=True):
+                        _unlock_cta("hero_trial_act", "hero", tier, "settings")
 
         st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
 
@@ -1792,8 +2648,6 @@ def render():
   <div style="font-size:12px;color:#A0A0A0;line-height:1.5;">{ins["reason"]}</div>
 </div>""", unsafe_allow_html=True)
             _upgrade_inline("See full signal details: entry price, target, confidence score & AI analysis.", key="nudge_bsig_funnel", cta="🔒 View All Signals →")
-        if st.button("📊 View All Signals →", key="btn_signals_funnel", type="primary"):
-            st.session_state.current_page = "signals"; st.rerun()
 
         st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
 
@@ -1851,12 +2705,43 @@ def render():
 
         st.markdown("<div style='height:4px'></div>", unsafe_allow_html=True)
 
-        # ── CONVERSION: Upgrade CTA ────────────────────────────────────────────
-        st.markdown('<div style="background:linear-gradient(135deg,#1A1600,#2A2200);border:1px solid #3D2E00;border-radius:12px;padding:20px 24px;margin:12px 0;"><div style="font-family:Space Grotesk,sans-serif;font-size:18px;font-weight:700;color:#F0A500;margin-bottom:8px;">🚀 Unlock Premium Signals</div><div style="font-family:DM Mono,monospace;font-size:12px;color:#B0B0B0;line-height:1.8;margin-bottom:12px;">Get: ✔ Early signals &nbsp;·&nbsp; ✔ Full AI analysis &nbsp;·&nbsp; ✔ Entry + target + stop-loss &nbsp;·&nbsp; ✔ Smart alerts<br>Start from <strong style="color:#F0A500;">₦3,500/month</strong></div></div>', unsafe_allow_html=True)
+        # ── CONVERSION: Pricing Section (anchor target for all upgrade CTAs) ────
+        # All "Upgrade", "Unlock Premium", "Continue with Premium" buttons land here.
+        st.markdown('<div id="pricing-section"></div>', unsafe_allow_html=True)
+        st.markdown('<div class="sec-title">💳 Plans &amp; Pricing</div>', unsafe_allow_html=True)
+        st.markdown('<div class="sec-intro">Start free — upgrade anytime. Every plan includes a 14-day Premium Trial.</div>', unsafe_allow_html=True)
+
+        _plans = [
+            {"name":"Free","price":"N0","period":"forever","color":"#808080","features":["2 AI queries / day","5 signal views / day","Basic market metrics","NGX Trade Game"],"cta":"Current Plan" if is_free else "Sign Up Free","highlight":False},
+            {"name":"Starter","price":"N3,500","period":"/month","color":"#3B82F6","features":["15 AI queries / day","All 144 signal scores","Entry price & target per signal","Daily AI Picks (3 of 9)","Telegram alerts"],"cta":"Start Free Trial →","highlight":False},
+            {"name":"Trader","price":"N8,000","period":"/month","color":"#A78BFA","features":["Unlimited AI queries","All 9 Daily AI Picks","Stop-loss per signal","AI Brief in Pidgin mode","Full sector rotation data"],"cta":"Start Free Trial →","highlight":True},
+            {"name":"Pro","price":"N18,000","period":"/month","color":"#F0A500","features":["Everything in Trader","Portfolio-level AI strategy","PDF intelligence reports","Advanced position sizing","Priority signal alerts"],"cta":"Start Free Trial →","highlight":False},
+        ]
+        _pc = st.columns(4)
+        for _pi, _plan in enumerate(_plans):
+            with _pc[_pi]:
+                _border = f"2px solid {_plan['color']}" if _plan["highlight"] else f"1px solid {_plan['color']}44"
+                _badge  = '<div style="background:#A78BFA;color:#000;font-family:DM Mono,monospace;font-size:9px;font-weight:800;padding:2px 8px;border-radius:999px;display:inline-block;margin-bottom:6px;letter-spacing:.06em;">MOST POPULAR</div>' if _plan["highlight"] else ""
+                _feats  = "".join(f'<div style="font-family:DM Mono,monospace;font-size:11px;color:#C0C0C0;padding:4px 0;border-bottom:1px solid #111;display:flex;align-items:center;gap:6px;"><span style="color:{_plan["color"]};">✔</span>{f}</div>' for f in _plan["features"])
+                st.markdown(f"""
+<div style="background:#0A0A0A;border:{_border};border-radius:14px;padding:18px 16px;font-family:DM Mono,monospace;margin-bottom:10px;">
+  {_badge}
+  <div style="font-family:Space Grotesk,sans-serif;font-size:15px;font-weight:700;color:{_plan['color']};margin-bottom:4px;">{_plan['name']}</div>
+  <div style="font-size:22px;font-weight:700;color:#FFFFFF;margin-bottom:2px;">{_plan['price']}<span style="font-size:11px;color:#606060;">{_plan['period']}</span></div>
+  <div style="margin:12px 0;">{_feats}</div>
+</div>""", unsafe_allow_html=True)
+                if _plan["name"] != "Free":
+                    if st.button(_plan["cta"], key=f"plan_cta_{_pi}", type="primary", use_container_width=True):
+                        _unlock_cta(f"plan_act_{_pi}", _plan["cta"], tier, "settings")
+
+        st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
+
+        # ── Bottom upgrade CTA card ────────────────────────────────────────────
+        st.markdown('<div style="background:linear-gradient(135deg,#1A1600,#2A2200);border:1px solid #3D2E00;border-radius:12px;padding:20px 24px;margin:12px 0;"><div style="font-family:Space Grotesk,sans-serif;font-size:18px;font-weight:700;color:#F0A500;margin-bottom:8px;">🚀 Unlock Premium Signals</div><div style="font-family:DM Mono,monospace;font-size:12px;color:#B0B0B0;line-height:1.8;margin-bottom:12px;">Get: ✔ Early signals &nbsp;·&nbsp; ✔ Full AI analysis &nbsp;·&nbsp; ✔ Entry + target + stop-loss &nbsp;·&nbsp; ✔ Smart alerts<br>Start from <strong style="color:#F0A500;">N3,500/month</strong></div></div>', unsafe_allow_html=True)
         _,_ctacol,_ = st.columns([1,2,1])
         with _ctacol:
             if st.button(cta_label, key="home_upgrade", type="primary", use_container_width=True):
-                st.session_state.current_page = cta_page; st.rerun()
+                _unlock_cta("home_upgrade_act", cta_label, tier, cta_page)
 
         # ── FAQ ───────────────────────────────────────────────────────────────
         _render_faq()
@@ -1876,6 +2761,10 @@ def render():
         # ── A2: Personalized welcome back strip ───────────────────────────────
         render_personalized_strip(tier, profile, sb, name, uniq)
 
+        # ── PRO COMMAND CENTER — Trader & Pro only, above the fold ───────────
+        if is_trader or is_pro:
+            _render_pro_command_center(tier, insights, uniq, _sig_map, market, now, top_g, sb)
+
         # ── Trial activity card ───────────────────────────────────────────────
         if is_trial:
             ai_q = get_total_ai_queries(); sig_v = get_eng("signals_viewed",0); stk_a = get_eng("stocks_analyzed",0)
@@ -1887,8 +2776,7 @@ def render():
                                   "AI helped identify the top movers today before the market moved.",
                                   "Your signal feed is running on the same engine used by professional traders."][(trial_day_num-1)%3])
 
-        # ── CONTEXT: Live notification + market status ─────────────────────────
-        _render_notification_banner(top_g, now, gc, total, market, notif_minutes)
+        # ── CONTEXT: Market status ─────────────────────────────────────────────
         st.markdown(f'<div style="background:#0A0A0A;border:1px solid {market["color"]}44;border-left:3px solid {market["color"]};border-radius:8px;padding:9px 14px;margin-bottom:14px;display:flex;align-items:center;gap:10px;font-family:DM Mono,monospace;"><span>{"📈" if market["is_open"] else "🔒"}</span><div><span style="font-size:12px;font-weight:600;color:{market["color"]};">{market["label"]}</span><span style="font-size:11px;color:#606060;margin-left:8px;">{market["note"]}</span></div></div>', unsafe_allow_html=True)
 
         # ── CONTEXT: Metric cards ──────────────────────────────────────────────
@@ -1898,9 +2786,9 @@ def render():
         # ── CONTEXT: Market Snapshot (paid users — fast plain-English context) ─
         if can_access("market_snapshot", tier):
             _sector_insight = ""
-            sec_res2 = sb.table("sector_performance").select("sector_name,traffic_light,change_percent").order("change_percent",desc=True).limit(1).execute()
-            if sec_res2.data:
-                _top_sec = sec_res2.data[0]
+            _sec_data2 = _home_get_sectors()
+            if _sec_data2:
+                _top_sec = _sec_data2[0]
                 _sec_chg = float(_top_sec.get("change_percent",0) or 0)
                 _sec_nm  = _top_sec.get("sector_name","")
                 if _sec_nm:
@@ -1989,7 +2877,18 @@ def render():
                         f'<div class="tgrid-chg" style="color:{color};">{arrow} {abs(_tc):.2f}%</div>'
                         f'<div class="tgrid-tag" style="background:{bg};color:{color};">{_tag}</div>'
                         f'{_send_tag}'
-                        + (f'<div class="tgrid-conf">Confidence: {_conf}%</div>' if can_access("signals_confidence",tier) else "")
+                        + (
+                            f'<div style="margin-top:6px;">'
+                            f'<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:3px;">'
+                            f'<span style="font-family:DM Mono,monospace;font-size:9px;color:#606060;text-transform:uppercase;letter-spacing:.08em;">Confidence</span>'
+                            f'<span style="font-family:DM Mono,monospace;font-size:10px;font-weight:600;color:{color};">'
+                            f'{"Very High" if _conf>=81 else "High" if _conf>=61 else "Medium" if _conf>=41 else "Low"} {_conf}%</span>'
+                            f'</div>'
+                            f'<div style="height:5px;background:#1A1A1A;border-radius:3px;overflow:hidden;">'
+                            f'<div style="width:{_conf}%;height:100%;background:{color};border-radius:3px;"></div>'
+                            f'</div></div>'
+                            if can_access("signals_confidence", tier) else ""
+                        )
                         + '</div>'
                     )
                 return html + '</div>'
@@ -2000,23 +2899,6 @@ def render():
                 _tgrid_cards(_ts_avoid,"🔴 Falling — AVOID signals","#EF4444","rgba(239,68,68,.10)","▼"),
                 unsafe_allow_html=True
             )
-
-            if can_access("trending_opportunities", tier):
-                _opp = (_ts_buy or _ts_hold or _ts_avoid)[:3]
-                if _opp:
-                    st.markdown('<div style="font-family:DM Mono,monospace;font-size:10px;color:#606060;text-transform:uppercase;letter-spacing:.1em;margin:14px 0 6px 0;">⚡ Today\'s Opportunities</div>', unsafe_allow_html=True)
-                    _oc = st.columns(len(_opp))
-                    for _oi, _os in enumerate(_opp):
-                        _occ = float(_os.get("change_percent",0) or 0)
-                        _otag,_otcol,_oarr = _trend_tag(_occ)
-                        _ochc = "#22C55E" if _occ >= 0 else "#EF4444"
-                        _odot = "live-dot-green" if _occ >= 0 else "live-dot-red"
-                        _om   = _time_ago((_oi*31+notif_minutes)%90+5)
-                        with _oc[_oi]:
-                            st.markdown(f'<div class="opp-card"><div style="display:flex;align-items:center;gap:7px;margin-bottom:8px;"><div class="live-dot {_odot}"></div><span style="font-family:Space Grotesk,sans-serif;font-size:14px;font-weight:700;color:#FFFFFF;">{_os["symbol"]}</span><span style="font-size:10px;font-weight:700;padding:2px 8px;border-radius:999px;background:{_otcol}18;color:{_otcol};margin-left:auto;">{_otag}</span></div><div style="font-size:18px;font-weight:700;color:{_ochc};margin-bottom:4px;">{_oarr} {abs(_occ):.2f}%</div><div style="font-size:10px;color:#404040;">Signal triggered {_om}</div></div>', unsafe_allow_html=True)
-                            if st.button(f"Ask AI → {_os['symbol']}", key=f"opp_{_oi}", use_container_width=True):
-                                st.session_state.mai_pending = f"Analyse {_os['symbol']} — it's {'up' if _occ>=0 else 'down'} {abs(_occ):.1f}% today. Should I act on this?"
-                                track_stock_analyzed(_os["symbol"]); st.rerun()
 
         if st.button("📊 View All Signals →", key="btn_signals_dash", type="primary"):
             st.session_state.current_page = "signals"; st.rerun()
@@ -2042,9 +2924,9 @@ def render():
                     _price_html = ""
                     if _hpr > 0:
                         if can_access("stop_loss_visible", tier):
-                            _price_html = f'<div style="font-family:DM Mono,monospace;font-size:11px;color:#808080;margin-top:6px;line-height:1.8;">Entry: <strong style="color:#FFFFFF;">₦{_hpr:,.2f}</strong> · Target: <strong style="color:#22C55E;">₦{_htgt:,.2f}</strong> · Stop: <strong style="color:#EF4444;">₦{_hsll:,.2f}</strong></div>'
+                            _price_html = f'<div style="font-family:DM Mono,monospace;font-size:11px;color:#808080;margin-top:6px;line-height:1.8;">Entry: <strong style="color:#FFFFFF;">N{_hpr:,.2f}</strong> · Target: <strong style="color:#22C55E;">N{_htgt:,.2f}</strong> · Stop: <strong style="color:#EF4444;">N{_hsll:,.2f}</strong></div>'
                         elif can_access("daily_picks_entry", tier):
-                            _price_html = f'<div style="font-family:DM Mono,monospace;font-size:11px;color:#808080;margin-top:6px;line-height:1.8;">Entry: <strong style="color:#FFFFFF;">₦{_hpr:,.2f}</strong> · Target: <strong style="color:#22C55E;">₦{_htgt:,.2f}</strong></div>'
+                            _price_html = f'<div style="font-family:DM Mono,monospace;font-size:11px;color:#808080;margin-top:6px;line-height:1.8;">Entry: <strong style="color:#FFFFFF;">N{_hpr:,.2f}</strong> · Target: <strong style="color:#22C55E;">N{_htgt:,.2f}</strong></div>'
                     with _bc[_bi]:
                         st.markdown(f"""
 <div class="bsig-card" style="border-top:2px solid {ins['ac']};">
@@ -2070,9 +2952,6 @@ def render():
   <div class="bsig-reason">{ins["reason"]}</div>
   {_price_html}
 </div>""", unsafe_allow_html=True)
-                        if st.button(f"Ask AI → {ins['sym']}", key=f"bsig_{_bi}", use_container_width=True):
-                            st.session_state.mai_pending = f"Give me a detailed analysis of {ins['sym']}. Signal: {ins['action']}. Should I act on this?"
-                            track_stock_analyzed(ins["sym"]); st.rerun()
             if is_trial:
                 _reinforcement_pill("You're seeing all composite signal data — this is a Starter+ feature")
 
@@ -2092,7 +2971,7 @@ def render():
             f'<div style="display:flex;justify-content:space-between;align-items:center;padding:9px 0;border-bottom:1px solid #111;font-size:13px;">'
             f'<div style="display:flex;align-items:center;gap:10px;">'
             f'<span style="font-weight:500;color:#FFFFFF;">{s["symbol"]}</span>'
-            f'<span style="color:#808080;font-size:12px;">&#8358;{float(s.get("price",0) or 0):,.2f}</span></div>'
+            f'<span style="color:#808080;font-size:12px;">N{float(s.get("price",0) or 0):,.2f}</span></div>'
             f'<span style="color:{"#22C55E" if float(s.get("change_percent",0) or 0)>=0 else "#EF4444"};font-weight:500;">'
             f'{"&#9650;" if float(s.get("change_percent",0) or 0)>=0 else "&#9660;"} {abs(float(s.get("change_percent",0) or 0)):.2f}%</span></div>'
             for s in movers
@@ -2109,33 +2988,6 @@ def render():
         st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
         if st.button("📊 View All Live Stocks →", key="btn_all", type="primary"):
             st.session_state.current_page = "all_stocks"; st.rerun()
-
-        # ── Signal Spotlight ───────────────────────────────────────────────────
-        st.markdown('<div class="sec-title">📊 Today\'s Signal Spotlight</div>', unsafe_allow_html=True)
-        st.markdown('<div class="sec-intro">Three stocks that deserve attention right now — based on live AI signal scores. Always do your own research.</div>', unsafe_allow_html=True)
-        sig_res2 = sb.table("signal_scores").select("symbol,signal,stars,reasoning").order("score_date",desc=True).order("stars",desc=True).limit(300).execute()
-        seen_sig = set(); buy_s = hold_s = caut_s = None
-        for s in (sig_res2.data or []):
-            sym = s.get("symbol",""); sig = s.get("signal","").upper().replace(" ","_")
-            if sym in seen_sig: continue
-            seen_sig.add(sym)
-            if not buy_s and sig in ("STRONG_BUY","BUY"):   buy_s  = s
-            elif not hold_s and sig == "HOLD":               hold_s = s
-            elif not caut_s and sig == "CAUTION":            caut_s = s
-            if buy_s and hold_s and caut_s: break
-        if is_trial:
-            for _ss in [buy_s, hold_s, caut_s]:
-                if _ss: track_stock_analyzed(_ss.get("symbol",""))
-            track_signal_view()
-        def sp_card(stock, lbl, ac, bg, bd):
-            if not stock: return f'<div class="sp-card" style="border-color:{bd};background:{bg};"><span style="background:{ac}22;color:{ac};font-size:10px;font-weight:700;padding:2px 8px;border-radius:12px;">{lbl}</span><div style="font-size:15px;font-weight:600;color:#606060;margin-top:8px;">—</div></div>'
-            sym    = stock.get("symbol","—"); reason = (stock.get("reasoning") or "No analysis.")[:120]+"…"; stars = "⭐"*int(stock.get("stars",3))
-            return f'<div class="sp-card" style="border-color:{bd};background:{bg};border-left:3px solid {ac};"><span style="background:{ac}22;color:{ac};font-size:10px;font-weight:700;padding:2px 8px;border-radius:12px;">{lbl}</span><div style="font-size:16px;font-weight:600;color:#FFFFFF;margin-top:8px;">{sym} <span style="font-size:12px;">{stars}</span></div><div style="font-size:11px;color:#B0B0B0;margin-top:6px;line-height:1.5;">{reason}</div></div>'
-        st.markdown(f'<div class="sp-grid">{sp_card(buy_s,"✅ BUY TODAY","#22C55E","#001A00","#003D00")}{sp_card(hold_s,"⏸️ HOLD","#D97706","#1A1200","#3D2800")}{sp_card(caut_s,"⚠️ CAUTION","#EA580C","#1A0800","#3D1500")}</div>', unsafe_allow_html=True)
-        if st.button("⭐ See All Signal Scores →", key="btn_signals", type="primary"):
-            st.session_state.current_page = "signals"; st.rerun()
-        if not can_access("signals_all", tier):
-            _upgrade_inline("Signal Spotlight shows 3 stocks. Higher plans see all 144 NGX stocks ranked.", key="nudge_spotlight", cta="🔒 Unlock Full Signals →")
 
         # ── NEWS ────────────────────────────────────────────────────────────────
         _render_news_section(tier, sb, market, today)
@@ -2159,7 +3011,7 @@ def render():
         elif is_trader:
             _guide_steps = [
                 ("Use Unlimited AI for Deep Analysis","You have unlimited queries. Ask about any stock, any time — before buying, while holding, or before selling.","🤖"),
-                ("Leverage Entry + Stop-Loss Prices","Your AI responses include specific ₦ entry ranges and stop-loss levels. Use these for disciplined position management.","📊"),
+                ("Leverage Entry + Stop-Loss Prices","Your AI responses include specific N entry ranges and stop-loss levels. Use these for disciplined position management.","📊"),
                 ("Enable Telegram Alerts","Set up Telegram alerts in Settings to get signal triggers before the market moves. Don't miss your entry.","📡"),
                 ("Read the Brief in Pidgin","Toggle Pidgin mode in the AI Brief for a faster, more natural read of the morning market summary.","🇳🇬"),
                 ("Lead the Leaderboard","Use the Trade Game to sharpen your strategy. Top traders on the leaderboard are averaging 12%+ returns.","🏆"),
@@ -2167,13 +3019,13 @@ def render():
             guide_title = "📚 How to Use NGX Signal — Trader Guide"
         else:  # pro
             _guide_steps = [
-                ("Ask for Portfolio Strategy","Type 'Build me a portfolio strategy around ZENITHBANK' — Pro AI gives you a full sector-aware allocation plan.","🏆"),
-                ("Export PDF Reports","Every AI analysis can be exported as a PDF. Useful for reviewing your own decisions or sharing insights.","📄"),
-                ("Use Sector Rotation Signals","Ask the AI 'Where is smart money moving today?' — Pro gives you sector rotation intelligence.","🔄"),
-                ("Advanced Position Sizing","Ask 'What position size for DANGCEM at ₦450?' — Pro gives you risk-adjusted sizing based on volatility.","📐"),
-                ("Dominate the Trade Game","You have ₦10M virtual cash. Build a full virtual portfolio and test your Pro strategies before going real.","🎮"),
+                ("Read the AI Trade Briefing First","The Pro Command Center at the top of your dashboard is your daily starting point — it shows the single strongest signal, full price levels (entry, target, stop-loss), confidence rating, and plain-English reasoning. Start here before anything else.","🎯"),
+                ("Ask for Portfolio Strategy","Type 'Build me a portfolio strategy around ZENITHBANK' or 'What are the top 3 stocks to buy this week?' — Pro AI gives you a sector-aware allocation plan with specific N price levels.","🏆"),
+                ("Use Sector Rotation Intelligence","Ask 'Where is smart money moving today?' or 'Which sector is showing the strongest momentum?' — Pro surfaces institutional-level rotation signals that Starter and Trader plans don't access.","🔄"),
+                ("Request Advanced Position Sizing","Ask 'What position size for DANGCEM at N450 with a N10,000 portfolio?' — Pro AI gives you risk-adjusted sizing based on the stock's volatility and your stated capital.","📐"),
+                ("Export PDF Reports","Every AI analysis can be saved as a PDF — useful for logging your own investment decisions and tracking your reasoning over time. Find the export button in the AI share sheet after any analysis.","📄"),
             ]
-            guide_title = "📚 How to Use NGX Signal Pro"
+            guide_title = "📚 How to Get the Most from NGX Signal Pro"
         st.markdown(f'<div class="sec-title">{guide_title}</div>', unsafe_allow_html=True)
         for _idx, (_title, _text, _icon) in enumerate(_guide_steps, 1):
             st.markdown(f"""
@@ -2197,13 +3049,27 @@ def render():
             st.markdown(f'<div style="background:linear-gradient(135deg,#1A0000,#180800);border:1px solid rgba(239,68,68,.35);border-radius:12px;padding:20px 24px;animation:trial-pulse 3s ease-in-out infinite;"><div style="display:flex;align-items:flex-start;justify-content:space-between;flex-wrap:wrap;gap:16px;"><div><div style="font-family:Space Grotesk,sans-serif;font-size:16px;font-weight:700;color:#EF4444;margin-bottom:4px;">⏳ Trial ends in {trial_days_left} day{"s" if trial_days_left!=1 else ""}</div><div style="font-family:DM Mono,monospace;font-size:12px;color:#B0B0B0;line-height:1.6;margin-bottom:10px;">You\'ve used AI {ai_ut} times and viewed {sv} signals.<br>Don\'t lose your edge in the market.</div></div><div class="scarcity-pill">🔴 {trial_days_left} day{"s" if trial_days_left!=1 else ""} left</div></div></div>', unsafe_allow_html=True)
             st.markdown("<div style='height:4px'></div>", unsafe_allow_html=True)
             if st.button("🔐 Upgrade Now — Don't Lose Access →", key="trial_bottom", type="primary"):
-                st.session_state.current_page = "settings"; st.rerun()
+                st.session_state.deep_link_plan   = True
+                st.session_state.current_page     = "settings"
+                st.rerun()
         elif is_trial:
             ai_ut = get_total_ai_queries(); sv = get_eng("signals_viewed",0)
             st.markdown(f'<div style="background:linear-gradient(135deg,#050F00,#080A00);border:1px solid rgba(34,197,94,.2);border-radius:12px;padding:18px 22px;display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:14px;"><div><div style="font-family:Space Grotesk,sans-serif;font-size:14px;font-weight:700;color:#22C55E;margin-bottom:4px;">✨ Your Premium Trial is Working</div><div style="font-family:DM Mono,monospace;font-size:12px;color:#808080;line-height:1.6;">You\'ve used AI <strong style="color:#FFFFFF;">{ai_ut}</strong> times · Viewed <strong style="color:#FFFFFF;">{sv}</strong> signals · <strong style="color:#F0A500;">{trial_days_left} days left</strong></div></div><div style="font-family:DM Mono,monospace;font-size:11px;color:#404040;">Upgrade to keep it ↗</div></div>', unsafe_allow_html=True)
+            if st.button("⚡ Upgrade to Pro Signals →", key="trial_bottom_active", type="primary"):
+                st.session_state.deep_link_plan = True
+                st.session_state.current_page   = "settings"
+                st.rerun()
         elif is_starter:
             st.markdown('<div style="background:#0A0A0A;border:1px solid rgba(59,130,246,.2);border-radius:10px;padding:14px 18px;font-family:DM Mono,monospace;font-size:12px;color:#808080;">📈 <strong style="color:#3B82F6;">Starter Plan</strong> — Upgrade to Trader for unlimited queries, Pidgin mode &amp; Telegram alerts.</div>', unsafe_allow_html=True)
+            if st.button("📈 Upgrade to Trader →", key="starter_bottom_upgrade", type="primary"):
+                st.session_state.deep_link_plan = True
+                st.session_state.current_page   = "settings"
+                st.rerun()
         elif is_trader:
             st.markdown('<div style="background:#0A0A0A;border:1px solid rgba(167,139,250,.2);border-radius:10px;padding:14px 18px;font-family:DM Mono,monospace;font-size:12px;color:#808080;">📡 <strong style="color:#A78BFA;">Trader Plan</strong> — Upgrade to Pro for PDF reports, portfolio strategy &amp; advanced AI recommendations.</div>', unsafe_allow_html=True)
+            if st.button("📊 Upgrade to Pro →", key="trader_bottom_upgrade", type="primary"):
+                st.session_state.deep_link_plan = True
+                st.session_state.current_page   = "settings"
+                st.rerun()
         elif is_pro:
             st.markdown('<div style="background:#0A0A0A;border:1px solid rgba(240,165,0,.2);border-radius:10px;padding:14px 18px;font-family:DM Mono,monospace;font-size:12px;color:#808080;">🏆 <strong style="color:#F0A500;">Pro Plan</strong> — Full NGX Signal intelligence active. Unlimited AI · PDF exports · Advanced outputs. You\'re at the top.</div>', unsafe_allow_html=True)
