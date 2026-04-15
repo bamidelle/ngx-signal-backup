@@ -3,6 +3,41 @@ from app.utils.supabase_client import get_supabase
 from app.components.inline_alert_widget import load_user_alerts, render_alert_widget, _bell_label
 from app.utils.webpushr import maybe_push_signal
 
+# ══════════════════════════════════════════════════════════════════════════════
+# CACHED DB FETCHERS — signals.py
+# Both Supabase calls in render() hit these cached versions.
+# Filter changes, pagination, and nav reruns never re-query the database.
+# ══════════════════════════════════════════════════════════════════════════════
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _sig_fetch_scores() -> list:
+    """All signal scores rows. Cached 5 min."""
+    from app.utils.supabase_client import get_supabase as _gsb
+    try:
+        res = _gsb().table("signal_scores") \
+            .select("*") \
+            .order("score_date", desc=True) \
+            .order("stars", desc=True) \
+            .limit(500).execute()
+        return res.data or []
+    except Exception:
+        return []
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _sig_fetch_prices() -> list:
+    """Latest stock prices for signals page. Cached 5 min."""
+    from app.utils.supabase_client import get_supabase as _gsb
+    try:
+        res = _gsb().table("stock_prices") \
+            .select("symbol, price, change_percent, volume") \
+            .order("trading_date", desc=True) \
+            .limit(500).execute()
+        return res.data or []
+    except Exception:
+        return []
+
+
 SIGNAL_CONFIG = {
     "STRONG_BUY":     ("#16A34A", "⭐⭐⭐⭐⭐", "STRONG BUY"),
     "BUY":            ("#22C55E", "⭐⭐⭐⭐",   "BUY"),
@@ -16,9 +51,6 @@ DEFAULT_CONFIG = ("#6B7280", "⭐⭐⭐", "HOLD")
 
 # ══════════════════════════════════════════════════════════════
 # RICH NARRATIVE GENERATOR
-# Produces a full plain-English analysis for every stock using
-# only the numeric data already in signal_scores + stock_prices.
-# No external API calls — deterministic, instant, always runs.
 # ══════════════════════════════════════════════════════════════
 
 def generate_signal_narrative(
@@ -28,21 +60,14 @@ def generate_signal_narrative(
     price: float,
     chg: float,
     volume: int,
-    momentum: float,   # 0-1
-    vol_score: float,  # 0-1
-    composite: float,  # 0-1  (news_score field)
+    momentum: float,
+    vol_score: float,
+    composite: float,
     db_reasoning: str = "",
 ) -> str:
-    """
-    Returns a rich, multi-sentence signal narrative.
-    If the DB already has a long, meaningful narrative (>120 chars) it is
-    kept as-is. Otherwise a full narrative is generated from the numbers.
-    """
-    # Keep rich DB content when it exists
     if db_reasoning and len(db_reasoning.strip()) > 120:
         return db_reasoning.strip()
 
-    # ── No price data edge-case ───────────────────────
     if price <= 0:
         return (
             f"No price data has been recorded for {symbol} yet. "
@@ -52,18 +77,16 @@ def generate_signal_narrative(
             f"It will appear with full analysis on the next successful market data run."
         )
 
-    # ── Helper values ─────────────────────────────────
     abs_chg   = abs(chg)
     is_gain   = chg >= 0
     arrow     = "▲" if is_gain else "▼"
     chg_str   = "{:+.2f}".format(chg)
-    price_str = "₦{:,.2f}".format(price)
+    price_str = "N{:,.2f}".format(price)
     m_pct     = int(min(momentum,  1.0) * 100)
     v_pct     = int(min(vol_score, 1.0) * 100)
     c_pct     = int(min(composite, 1.0) * 100)
     vol_str   = "{:,}".format(volume) if volume > 0 else "N/A"
 
-    # ── Momentum narrative ────────────────────────────
     if m_pct >= 75:
         mom_line = (
             f"Momentum is strong at {m_pct}% — buyers have been in control "
@@ -88,7 +111,6 @@ def generate_signal_narrative(
             f"and price has been drifting or declining."
         )
 
-    # ── Volume narrative ──────────────────────────────
     if v_pct >= 75:
         vol_line = (
             f"Volume is significantly above average ({v_pct}% score) — "
@@ -115,7 +137,6 @@ def generate_signal_narrative(
             f"Moves on low volume are easier to reverse — treat with caution."
         )
 
-    # ── Today's price move narrative ──────────────────
     if abs_chg >= 9.5 and is_gain:
         move_line = (
             f"{symbol} hit the NGX daily ceiling today, surging {chg_str}% to {price_str}. "
@@ -159,7 +180,6 @@ def generate_signal_narrative(
             f"The market is taking a breath — no strong push in either direction."
         )
 
-    # ── Composite / overall signal verdict ────────────
     if signal_code == "STRONG_BUY":
         verdict = (
             f"With {stars} stars and a composite score of {c_pct}%, "
@@ -211,8 +231,6 @@ def generate_signal_narrative(
             f"Review the score breakdown below before making any decision."
         )
 
-    # ── Assemble final narrative ───────────────────────
-    # Use the DB short text as a lead-in quote if it exists and is non-trivial
     lead = ""
     if db_reasoning and len(db_reasoning.strip()) > 10:
         lead = db_reasoning.strip().rstrip(".") + ". "
@@ -222,21 +240,12 @@ def generate_signal_narrative(
 
 # ══════════════════════════════════════════════════════════════════════════════
 # MARKET SENTIMENT INTELLIGENCE ENGINE v2
-# ─────────────────────────────────────────────────────────────────────────────
-# Layer 1 — Real news:  Google News RSS fetch per stock (free, no key needed)
-# Layer 2 — AI brain:   Groq (Llama 3.1) → Gemini fallback interprets headlines
-# Layer 3 — Fallback:   Number-based logic if news fetch or AI both fail
-#
-# Cache TTL: 30 minutes per stock — safe for Streamlit Cloud rate limits
-# Max headlines passed to AI: 5 (keeps tokens low, cost = ~$0)
 # ══════════════════════════════════════════════════════════════════════════════
 
 import hashlib
 import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta
 
-
-# ── Cache helpers ─────────────────────────────────────────────────────────────
 
 def _sentiment_cache_key(symbol: str) -> str:
     return f"_mri_{symbol}"
@@ -254,8 +263,6 @@ def _set_cache(symbol: str, data: dict):
 def _get_cache(symbol: str) -> dict | None:
     return st.session_state.get(_sentiment_cache_key(symbol))
 
-
-# ── Layer 1: Google News RSS fetch ────────────────────────────────────────────
 
 _TICKER_NAME_MAP = {
     "ZENITHBANK": "Zenith Bank Nigeria",
@@ -291,7 +298,6 @@ _TICKER_NAME_MAP = {
     "LAFARGE": "Lafarge Africa Nigeria",
     "GEREGU": "Geregu Power Nigeria",
     "TRANSPOWER": "Transmission Company Nigeria",
-    "FBNH": "FBN Holdings Nigeria First Bank",
     "WEMA": "Wema Bank Nigeria",
     "FCMB": "FCMB Group Nigeria First City Monument",
     "ETI": "Ecobank Transnational Nigeria ETI",
@@ -311,10 +317,6 @@ def _company_search_term(symbol: str) -> str:
     return _TICKER_NAME_MAP.get(symbol.upper(), f"{symbol} Nigeria stock NGX")
 
 def fetch_stock_news(symbol: str, max_items: int = 5) -> list:
-    """
-    Fetch recent headlines from Google News RSS (free, no API key).
-    Returns list of {title, source, age_hours} dicts. Returns [] on failure.
-    """
     import requests as _req
     search_term = _company_search_term(symbol)
     query = search_term.replace(" ", "+")
@@ -347,8 +349,6 @@ def fetch_stock_news(symbol: str, max_items: int = 5) -> list:
         return []
 
 
-# ── Layer 2: AI interprets headlines ─────────────────────────────────────────
-
 def _build_sentiment_prompt(symbol, headlines, signal_code, chg, volume, momentum, vol_score):
     is_gain   = chg >= 0
     direction = f"UP {chg:+.2f}%" if is_gain else f"DOWN {chg:+.2f}%"
@@ -363,55 +363,49 @@ def _build_sentiment_prompt(symbol, headlines, signal_code, chg, volume, momentu
 
     return f"""You are a Nigerian stock market intelligence assistant for NGX Signal.
 
-A user is looking at {symbol} on the NGX. Here is the data:
+Stock: {symbol}
+Today's move: {direction}
+Signal: {sig_lbl}
+Momentum score: {m_pct}%
+Volume score: {v_pct}% ({vol_str} shares)
 
-MARKET DATA:
-- Signal: {sig_lbl}
-- Price change today: {direction}
-- Momentum score: {m_pct}%
-- Volume score: {v_pct}% (volume today: {vol_str} shares)
-
-RECENT NEWS HEADLINES (last 7 days):
+Recent headlines:
 {headlines_text}
 
-YOUR JOB:
-Read the headlines and market data, then write a "What's Really Driving This" explanation.
-Use ONLY simple everyday English. No jargon. Write like explaining to a friend.
+Return ONLY valid JSON with these exact keys:
+{{
+  "situation": "CONFIRMED_MOVE" | "HYPE" | "QUIET_OPPORTUNITY" | "CONFLICT" | "NO_DATA",
+  "line1": "one sentence explaining what's driving the stock",
+  "line2": "one sentence adding context or a caveat (can be empty string)",
+  "verdict": "plain English verdict for a retail investor",
+  "tag_line1": "short phrase for what's happening (max 8 words)",
+  "tag_arrow": "short phrase for what to watch (max 6 words)"
+}}
 
-Respond ONLY with a JSON object — no markdown, no extra text:
-{{"situation":"CONFIRMED_MOVE"|"HYPE"|"QUIET_OPPORTUNITY"|"CONFLICT"|"NO_DATA","line1":"One sentence about what news or public attention is saying — be specific about actual events if headlines exist","line2":"One sentence about what the actual market behavior shows","verdict":"One short human conclusion — max 18 words","tag_line1":"Very short (max 8 words) — what is happening","tag_arrow":"Very short (max 6 words) — key takeaway"}}
+No preamble. No markdown. Raw JSON only."""
 
-SITUATION GUIDE:
-- CONFIRMED_MOVE: News AND market data agree on direction
-- HYPE: Lots of news excitement but weak actual buying/selling
-- QUIET_OPPORTUNITY: Strong market move but little news coverage
-- CONFLICT: News says one thing, market data says opposite
-- NO_DATA: No meaningful news or signal
 
-CRITICAL RULES:
-- If headlines mention earnings, dividends, acquisitions, profit results — mention them DIRECTLY in line1
-- NEVER use: bullish, bearish, RSI, resistance, support, technical, fundamentals
-- Keep line1 and line2 under 20 words each
-- verdict must be actionable — max 18 words
-"""
-
-def _call_ai_for_sentiment(prompt: str):
+def _call_ai_for_sentiment(prompt: str) -> dict | None:
     import requests as _req, json as _json
-    for key_name, make_req in [
-        ("GROQ_API_KEY", lambda k: (
-            "https://api.groq.com/openai/v1/chat/completions",
-            {"model": "llama-3.1-8b-instant", "messages": [{"role": "user", "content": prompt}], "max_tokens": 320, "temperature": 0.25},
-            {"Authorization": f"Bearer {k}", "Content-Type": "application/json"},
-            lambda d: d["choices"][0]["message"]["content"],
-        )),
-        ("GEMINI_API_KEY", lambda k: (
-            f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash-latest:generateContent?key={k}",
-            {"contents": [{"parts": [{"text": prompt}]}], "generationConfig": {"maxOutputTokens": 320, "temperature": 0.25}},
-            {},
-            lambda d: d["candidates"][0]["content"]["parts"][0]["text"],
-        )),
-    ]:
-        key = st.secrets.get(key_name, "")
+
+    def make_req(key: str):
+        if key.startswith("gsk_"):
+            url     = "https://api.groq.com/openai/v1/chat/completions"
+            payload = {"model": "llama-3.1-8b-instant", "messages": [{"role": "user", "content": prompt}], "max_tokens": 300, "temperature": 0.3}
+            headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
+            extract = lambda d: d["choices"][0]["message"]["content"]
+        else:
+            url     = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={key}"
+            payload = {"contents": [{"parts": [{"text": prompt}]}]}
+            headers = {"Content-Type": "application/json"}
+            extract = lambda d: d["candidates"][0]["content"]["parts"][0]["text"]
+        return url, payload, headers, extract
+
+    for key_name in ("GROQ_API_KEY", "GEMINI_API_KEY"):
+        try:
+            key = st.secrets.get(key_name, "")
+        except Exception:
+            key = ""
         if not key:
             continue
         try:
@@ -427,8 +421,6 @@ def _call_ai_for_sentiment(prompt: str):
             continue
     return None
 
-
-# ── Layer 3: Number-based fallback ────────────────────────────────────────────
 
 def _fallback_sentiment(symbol, signal_code, chg, vol_score, momentum, composite, volume):
     is_gain = chg >= 0
@@ -455,28 +447,16 @@ def _fallback_sentiment(symbol, signal_code, chg, vol_score, momentum, composite
         return {"situation":"QUIET_OPPORTUNITY","line1":f"No major news found for {symbol} today.","line2":f"The price is {move_word} on {vol_word}.","verdict":"Moving quietly — no news catalyst yet. Watch for one.","tag_line1":"Quiet move — no news found","tag_arrow":"No news trigger yet","color":"#D97706"}
 
 
-# ── Situation → color ─────────────────────────────────────────────────────────
-
 _SITUATION_COLOR = {"CONFIRMED_MOVE": None, "HYPE": "#F0A500", "QUIET_OPPORTUNITY": "#A78BFA", "CONFLICT": "#3B82F6", "NO_DATA": "#4B5563"}
 
 
-# ── Main public function ──────────────────────────────────────────────────────
-
 def generate_market_reality_block(symbol: str, signal_code: str, chg: float, volume: int, momentum: float, vol_score: float, composite: float, stars: int) -> dict:
-    """
-    Public entry point. Returns a sentiment dict.
-    Flow: cache → Google News RSS → Groq/Gemini AI → number fallback → cache
-    """
-    # 1. Cache check
     if _cache_is_fresh(symbol):
         cached = _get_cache(symbol)
         if cached:
             return cached
 
-    # 2. Fetch real news headlines
     headlines = fetch_stock_news(symbol, max_items=5)
-
-    # 3. AI interpretation
     result = None
     prompt  = _build_sentiment_prompt(symbol, headlines, signal_code, chg, volume, momentum, vol_score)
     ai_data = _call_ai_for_sentiment(prompt)
@@ -497,25 +477,16 @@ def generate_market_reality_block(symbol: str, signal_code: str, chg: float, vol
             "ai_powered": True,
         }
 
-    # 4. Fallback if AI failed
     if not result:
         result = _fallback_sentiment(symbol, signal_code, chg, vol_score, momentum, composite, volume)
         result["news_count"] = len(headlines)
         result["ai_powered"] = False
 
-    # 5. Cache and return
     _set_cache(symbol, result)
     return result
 
 
-# ── HTML renderer for Signal Page (MarketRealityBlock) ───────────────────────
-
 def render_market_reality_html(mri: dict, accent: str) -> str:
-    """
-    Returns the full HTML string for the MarketRealityBlock.
-    Inlined inside the existing st.components.v1.html card.
-    Placed ABOVE the rich narrative, BELOW the score bars.
-    """
     situation  = mri["situation"]
     line1      = mri["line1"]
     line2      = mri["line2"]
@@ -524,7 +495,6 @@ def render_market_reality_html(mri: dict, accent: str) -> str:
     news_count = mri.get("news_count", 0)
     ai_powered = mri.get("ai_powered", False)
 
-    # Situation badge
     badge_copy = {
         "CONFIRMED_MOVE":    ("✅", "Confirmed Move",   color),
         "HYPE":              ("⚠️", "Hype Alert",        "#F0A500"),
@@ -534,7 +504,6 @@ def render_market_reality_html(mri: dict, accent: str) -> str:
     }
     b_icon, b_label, b_color = badge_copy.get(situation, ("—", situation, "#4B5563"))
 
-    # Source indicator line
     if ai_powered and news_count > 0:
         source_html = (
             f'<div class="mri-source">'
@@ -577,10 +546,7 @@ def render_market_reality_html(mri: dict, accent: str) -> str:
 </div>"""
 
 
-# ── CSS for MarketRealityBlock (injected once inside the iframe styles) ───────
-
 MRI_CSS = """
-  /* ── MarketRealityBlock ── */
   .mri-wrap {
     background: #080A0D;
     border: 1px solid #1E2229;
@@ -661,8 +627,6 @@ MRI_CSS = """
 """
 
 
-# ── Short version for homepage Trending Now (TrendingSentimentTag) ────────────
-
 def generate_trending_sentiment_tag(
     symbol:    str,
     signal_code: str,
@@ -673,11 +637,6 @@ def generate_trending_sentiment_tag(
     composite: float,
     stars:     int,
 ) -> str:
-    """
-    Returns an HTML string for the TrendingSentimentTag.
-    Explains WHY the stock is trending using real news + AI interpretation.
-    Used inside the Trending Now cards on home.py.
-    """
     mri        = generate_market_reality_block(
         symbol=symbol, signal_code=signal_code,
         chg=chg, volume=volume, momentum=momentum,
@@ -705,26 +664,83 @@ def generate_trending_sentiment_tag(
     )
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# LOCKED VERDICT GATE — renders the blurred verdict box for free/visitor users
+# This is the core of TIER 1 FIX 1: gate the signal verdict, show scores free
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _render_locked_verdict_html(symbol: str, accent: str, stars_display: str) -> str:
+    """
+    Returns HTML for the blurred verdict gate shown to free/visitor users.
+    Shows: blurred signal badge + stars + a compelling free trial CTA.
+    The blur proves something exists without revealing what it is.
+    """
+    return f"""
+<div class="verdict-gate">
+  <!-- Blurred ghost of the actual verdict — proves it exists -->
+  <div class="verdict-ghost">
+    <div class="ghost-badge" style="background:{accent}33;border:1px solid {accent}55;">
+      <span style="filter:blur(5px);user-select:none;pointer-events:none;color:{accent};font-size:11px;font-weight:700;">STRONG BUY</span>
+    </div>
+    <div class="ghost-stars" style="filter:blur(3px);user-select:none;pointer-events:none;font-size:16px;">⭐⭐⭐⭐⭐</div>
+  </div>
+  <!-- Lock overlay -->
+  <div class="gate-lock">
+    <div class="gate-lock-icon">🔒</div>
+    <div class="gate-lock-text">Signal Ready — direction &amp; strength locked</div>
+  </div>
+  <!-- CTA -->
+  <a href="#" class="gate-cta">Start Free 14-Day Trial →</a>
+  <div class="gate-sub">No card required · Cancel any time</div>
+</div>"""
+
+
 def render():
     sb = get_supabase()
 
     profile  = st.session_state.get("profile", {})
-    plan     = profile.get("plan", "free")
+    plan     = (profile.get("plan") or "free").lower().strip()
     user     = st.session_state.get("user")
     alerts_by_symbol = load_user_alerts(sb, user)
+
+    TIER_ORDER = ["visitor", "free", "trial", "starter", "trader", "pro"]
+    PAID_TIERS = {"starter", "trader", "pro", "trial"}
+    if not user:
+        tier = "visitor"
+    elif plan in TIER_ORDER:
+        tier = plan
+    else:
+        tier = "free"
+    is_paid       = tier in PAID_TIERS
+    show_prices   = is_paid
+    show_full_nar = is_paid
+    show_mri      = is_paid
+    show_scores   = True
+    STARTER_RANK  = TIER_ORDER.index("starter")
+    show_conf_lbl = TIER_ORDER.index(tier) >= STARTER_RANK
 
     st.markdown("""
     <style>
     @import url('https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=Syne:wght@700;800&display=swap');
     .sig-header { font-family:'Syne',sans-serif; font-size:22px; font-weight:800; color:#E8E2D4; margin-bottom:4px; }
-    .sig-sub { font-family:'DM Mono',monospace; font-size:11px; color:#4B5563; text-transform:uppercase; letter-spacing:0.1em; margin-bottom:20px; }
+    .sig-sub { font-family:'DM Mono',monospace; font-size:11px; color:#4B5563; text-transform:uppercase; letter-spacing:0.1em; margin-bottom:12px; }
     .sig-count { font-family:'DM Mono',monospace; font-size:12px; color:#6B7280; margin-bottom:12px; }
+    .sig-seo-intro { font-family:'DM Mono',monospace; font-size:12px; color:#6B7280; line-height:1.7;
+                     background:#0A0A0A; border:1px solid #1F1F1F; border-radius:8px;
+                     padding:10px 14px; margin-bottom:14px; }
     </style>
     """, unsafe_allow_html=True)
 
     st.markdown("""
-    <div class="sig-header">⭐ Signal Scores</div>
-    <div class="sig-sub">AI-powered buy/sell/hold ratings — all NGX stocks</div>
+    <div class="sig-header">⭐ NGX Signal Scores</div>
+    <div class="sig-sub">AI-powered NGX stock signals · All 144+ listed equities · Updated daily</div>
+    <div class="sig-seo-intro">
+      Daily AI-generated momentum, volume and composite scores for every stock on the Nigerian Exchange (NGX).
+      Signals cover Banking (ZENITHBANK, GTCO, UBA, ACCESSCORP), Telecoms (MTNN, AIRTELAFRI),
+      Consumer Goods, Cement, Oil &amp; Gas, Insurance and all other NGX sectors.
+      <strong style="color:#F0A500;">See the scores for free.
+      Start a free trial to unlock signal direction, entry price, target and stop-loss.</strong>
+    </div>
     """, unsafe_allow_html=True)
 
     # ── FILTERS ──────────────────────────────────────
@@ -750,27 +766,18 @@ def render():
             key="sig_search"
         ).upper().strip()
 
-    # ── FETCH ─────────────────────────────────────────
-    scores_res = sb.table("signal_scores")\
-        .select("*")\
-        .order("score_date", desc=True)\
-        .order("stars", desc=True)\
-        .limit(500).execute()
-
-    prices_res = sb.table("stock_prices")\
-        .select("symbol, price, change_percent, volume")\
-        .order("trading_date", desc=True)\
-        .limit(500).execute()
+    # ── FETCH (CACHED — no DB hit on filter/sort reruns) ──────────────────────
+    scores_data = _sig_fetch_scores()
+    prices_data = _sig_fetch_prices()
 
     price_map = {}
-    for p in (prices_res.data or []):
+    for p in prices_data:
         if p["symbol"] not in price_map:
             price_map[p["symbol"]] = p
 
-    # Deduplicate signals — keep latest per symbol
     seen = set()
     all_scores = []
-    for s in (scores_res.data or []):
+    for s in scores_data:
         if s["symbol"] not in seen:
             seen.add(s["symbol"])
             all_scores.append(s)
@@ -798,28 +805,21 @@ def render():
     if search:
         filtered = [s for s in filtered if search in s.get("symbol", "")]
 
-    # ── SORT ─────────────────────────────────────────
     if sort_by == "Best % gain today":
         filtered = sorted(
             filtered,
-            key=lambda x: float(
-                price_map.get(x["symbol"], {}).get("change_percent", 0) or 0
-            ),
+            key=lambda x: float(price_map.get(x["symbol"], {}).get("change_percent", 0) or 0),
             reverse=True
         )
     elif sort_by == "Worst % loss today":
         filtered = sorted(
             filtered,
-            key=lambda x: float(
-                price_map.get(x["symbol"], {}).get("change_percent", 0) or 0
-            )
+            key=lambda x: float(price_map.get(x["symbol"], {}).get("change_percent", 0) or 0)
         )
     elif sort_by == "Highest volume":
         filtered = sorted(
             filtered,
-            key=lambda x: int(
-                price_map.get(x["symbol"], {}).get("volume", 0) or 0
-            ),
+            key=lambda x: int(price_map.get(x["symbol"], {}).get("volume", 0) or 0),
             reverse=True
         )
     elif sort_by == "Symbol A–Z":
@@ -862,8 +862,67 @@ def render():
         st.info("No signals match your filter.")
         return
 
-    # ── SIGNAL CARDS ─────────────────────────────────
-    for s in filtered:
+    # ── TIER 1 FIX 1+3: Gate notice with FREE TRIAL language ─────────────────
+    if not is_paid:
+        st.components.v1.html(f"""
+<!DOCTYPE html><html>
+<head>
+<link href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=Space+Grotesk:wght@600;700&display=swap" rel="stylesheet">
+<style>
+*{{margin:0;padding:0;box-sizing:border-box;}}
+body{{background:transparent;font-family:'DM Mono',monospace;overflow:hidden;padding:0 0 8px 0;}}
+.gate-banner{{
+  background:linear-gradient(135deg,#0D0A00,#0A0A0A);
+  border:1px solid rgba(240,165,0,.3);
+  border-left:4px solid #F0A500;
+  border-radius:10px;
+  padding:14px 18px;
+  display:flex;align-items:center;gap:14px;flex-wrap:wrap;
+}}
+.gate-icon{{font-size:18px;flex-shrink:0;}}
+.gate-body{{flex:1;min-width:180px;}}
+.gate-title{{font-size:12px;color:#E8E2D4;margin-bottom:3px;line-height:1.5;}}
+.gate-title strong{{color:#F0A500;}}
+.gate-sub{{font-size:10px;color:#4B5563;}}
+.gate-btn{{
+  background:#F0A500;color:#000;
+  font-size:11px;font-weight:700;
+  padding:9px 18px;border-radius:8px;
+  text-decoration:none;white-space:nowrap;
+  font-family:'Space Grotesk',sans-serif;
+  letter-spacing:.02em;flex-shrink:0;
+  display:inline-block;
+}}
+@media(max-width:480px){{
+  .gate-banner{{flex-direction:column;align-items:flex-start;gap:8px;}}
+  .gate-btn{{width:100%;text-align:center;}}
+}}
+</style>
+</head>
+<body>
+<div class="gate-banner">
+  <div class="gate-icon">📊</div>
+  <div class="gate-body">
+    <div class="gate-title">
+      <strong>Score bars, sector &amp; price data are free.</strong>
+      Signal direction, entry price, target &amp; stop-loss require a free trial.
+    </div>
+    <div class="gate-sub">14 days free · No credit card required</div>
+  </div>
+  <a href="#" class="gate-btn">Start Free 14-Day Trial →</a>
+</div>
+</body></html>
+""", height=82, scrolling=False)
+
+    # ── SIGNAL CARDS with TIER 2 FIX 5: Alternating reveal pattern ────────────
+    # Pattern: 1 open → 3 blurred → 1 open → 3 blurred → ...
+    # Position 0 = open (trust builder), positions 1-3 = blurred (FOMO), position 4 = open, etc.
+    REVEAL_PATTERN = [True, False, False, False, True, False, False, False]  # repeating
+
+    for card_idx, s in enumerate(filtered):
+        # Alternating reveal for free users: position in cycle determines visibility
+        is_open_card = REVEAL_PATTERN[card_idx % len(REVEAL_PATTERN)] if not is_paid else True
+
         symbol     = s.get("symbol", "")
         stars_num  = int(s.get("stars", 3))
         signal_raw = s.get("signal", "HOLD")
@@ -885,9 +944,7 @@ def render():
         vol_score = float(s.get("volume_score", 0) or 0)
         composite = float(s.get("news_score", 0) or 0)
 
-        # ── Split: short DB text shown above grid, rich narrative below score bars ──
         db_short = (s.get("reasoning", "") or "").strip()
-        # Truncate DB text to 1-2 lines for the header display
         db_short_display = db_short if len(db_short) <= 140 else db_short[:137] + "…"
 
         rich_narrative = generate_signal_narrative(
@@ -903,8 +960,6 @@ def render():
             db_reasoning = db_short,
         )
 
-        # ── Fire push notification for BULLISH / BREAKOUT signals ────────────
-        # Deduplication inside maybe_push_signal prevents repeat sends.
         maybe_push_signal(
             symbol      = symbol,
             signal_code = signal_code,
@@ -913,37 +968,48 @@ def render():
             chg         = chg,
         )
 
-        # Entry / Target / Stop Loss values
+        # Entry / Target / Stop Loss — paid plans only
         entry_price = target_price = stop_loss = potential = None
-        if signal_code in ("STRONG_BUY", "BUY", "BREAKOUT_WATCH") and price > 0:
+        if show_prices and signal_code in ("STRONG_BUY", "BUY", "BREAKOUT_WATCH") and price > 0:
             entry_price  = round(price * 1.002, 2)
             multiplier   = 1.12 if stars_num >= 5 else 1.08 if stars_num >= 4 else 1.06
             target_price = round(price * multiplier, 2)
             stop_loss    = round(price * 0.95, 2)
             potential    = round(((target_price - entry_price) / entry_price) * 100, 1)
 
-        price_display = f"₦{price:,.2f}" if price > 0 else "No price data"
+        price_display = f"N{price:,.2f}" if price > 0 else "No price data"
         vol_display   = f"Vol: {volume:,}" if volume > 0 else ""
 
-        # Score percentages
         m_pct = int(min(momentum,  1.0) * 100)
         v_pct = int(min(vol_score, 1.0) * 100)
         c_pct = int(min(composite, 1.0) * 100)
 
-        # ── Market Reality Intelligence block ─────────────────────────────
-        mri_data     = generate_market_reality_block(
-            symbol=symbol, signal_code=signal_code,
-            chg=chg, volume=volume, momentum=momentum,
-            vol_score=vol_score, composite=composite, stars=stars_num,
-        )
-        mri_html     = render_market_reality_html(mri_data, accent)
-        mri_text_len = len(mri_data["line1"]) + len(mri_data["line2"]) + len(mri_data["verdict"])
+        # For free/visitor users:
+        # - Open cards (trust builders): show score bars + 1-sentence snippet, reveal the label
+        # - Blurred cards (FOMO): show score bars + snippet, but gate the verdict/label
+        show_verdict = is_paid or is_open_card
 
-        # ── Dynamic height calculation ─────────────────────────────────────
-        # Estimate rendered lines for each content block at ~55 chars/line on mobile
+        if not show_full_nar:
+            _first_sent = rich_narrative.split(". ")[0] + "." if ". " in rich_narrative else rich_narrative[:120] + "…"
+            narrative_display = _first_sent
+        else:
+            narrative_display = rich_narrative
+
+        # MRI block — paid only
+        if show_mri:
+            mri_data     = generate_market_reality_block(
+                symbol=symbol, signal_code=signal_code,
+                chg=chg, volume=volume, momentum=momentum,
+                vol_score=vol_score, composite=composite, stars=stars_num,
+            )
+            mri_html     = render_market_reality_html(mri_data, accent)
+            mri_text_len = len(mri_data["line1"]) + len(mri_data["line2"]) + len(mri_data["verdict"])
+        else:
+            mri_html     = ""
+            mri_text_len = 0
+
+        # Dynamic height
         CHARS_PER_LINE = 55
-        PX_PER_LINE    = 18   # line-height ~1.75 * 11px font
-
         def est_height(text: str, font_px: int = 11, lh: float = 1.75) -> int:
             if not text:
                 return 0
@@ -954,29 +1020,39 @@ def render():
         h_db_short   = est_height(db_short_display, 11, 1.55) if db_short_display else 0
         h_action     = 90 if entry_price else 0
         h_scores     = 70
-        h_mri        = est_height(mri_text_len * "x", 11, 1.6) + 60  # MRI block incl. header + verdict
-        h_narrative  = est_height(rich_narrative, 11, 1.75)
+        h_mri        = est_height(mri_text_len * "x", 11, 1.6) + 60 if show_mri else 0
+        h_narrative  = est_height(narrative_display, 11, 1.75)
+        h_verdict_gate = 100 if not show_verdict else 0
         h_disclaimer = 24
-        h_padding    = 40   # body padding + section gaps
+        h_padding    = 40
 
         card_height = (
             h_badge + h_db_short + h_action +
-            h_scores + h_mri + h_narrative + h_disclaimer + h_padding
+            h_scores + h_mri + h_narrative + h_verdict_gate + h_disclaimer + h_padding
         )
-        # Clamp: never shorter than 320px, never taller than 1400px
         card_height = max(320, min(card_height, 1400))
 
-        with st.expander(
-            f"{stars_display}  {symbol}  —  {label}  ·  {price_display}"
-            f"  {_bell_label(symbol, alerts_by_symbol)}",
-            expanded=False
-        ):
+        # Build expander label — for blurred cards, hide the verdict label from non-paid
+        if show_verdict:
+            expander_label = (
+                f"{stars_display}  {symbol}  —  {label}  ·  {price_display}"
+                f"  {_bell_label(symbol, alerts_by_symbol)}"
+            )
+        else:
+            # Show stock name + score bars summary, hide the label
+            expander_label = (
+                f"📊  {symbol}  ·  {price_display}  ·  {arrow} {abs(chg):.2f}%  "
+                f"·  Momentum {m_pct}%  ·  🔒 Signal Ready"
+                f"  {_bell_label(symbol, alerts_by_symbol)}"
+            )
+
+        with st.expander(expander_label, expanded=False):
             st.components.v1.html(f"""
             <!DOCTYPE html>
             <html>
             <head>
             <meta name="viewport" content="width=device-width,initial-scale=1">
-            <link href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&display=swap"
+            <link href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=Space+Grotesk:wght@600;700;800&display=swap"
                   rel="stylesheet">
             <style>
               *, *::before, *::after {{ margin:0; padding:0; box-sizing:border-box; }}
@@ -989,6 +1065,7 @@ def render():
                 overflow-y: visible;
                 padding: 4px 0 10px 0;
               }}
+
               /* ── Badge row ── */
               .badge-row {{
                 display:flex; align-items:center; gap:8px;
@@ -1053,6 +1130,56 @@ def render():
                 line-height:1.75; margin-top:8px;
               }}
 
+              /* ── TIER 1 FIX 1: Verdict Gate (blurred verdict for free users) ── */
+              .verdict-gate {{
+                background:linear-gradient(135deg,#0D0A00 0%,#090A0D 100%);
+                border:1px solid rgba(240,165,0,.2);
+                border-radius:10px;
+                padding:14px 16px;
+                margin:10px 0;
+                text-align:center;
+                position:relative;
+                overflow:hidden;
+              }}
+              .verdict-gate::before {{
+                content:'';
+                position:absolute;top:0;left:0;right:0;
+                height:1px;
+                background:linear-gradient(90deg,transparent,{accent}66,transparent);
+              }}
+              .verdict-ghost {{
+                display:flex;align-items:center;justify-content:center;gap:10px;
+                margin-bottom:10px;
+              }}
+              .ghost-badge {{
+                padding:4px 14px;border-radius:20px;
+                display:inline-flex;align-items:center;
+              }}
+              .gate-lock {{
+                display:flex;align-items:center;justify-content:center;gap:6px;
+                margin-bottom:10px;
+              }}
+              .gate-lock-icon {{ font-size:14px; }}
+              .gate-lock-text {{
+                font-size:11px;color:#6B7280;
+              }}
+              .gate-cta {{
+                display:inline-block;
+                background:{accent};
+                color:#000;
+                font-size:12px;font-weight:700;
+                padding:10px 22px;border-radius:8px;
+                text-decoration:none;
+                font-family:'Space Grotesk',sans-serif;
+                letter-spacing:.02em;
+                cursor:pointer;
+                transition:opacity .15s;
+              }}
+              .gate-cta:hover{{ opacity:.85; }}
+              .gate-sub {{
+                font-size:9px;color:#374151;margin-top:7px;
+              }}
+
               /* ── Disclaimer ── */
               .disclaimer {{
                 font-size:9px; color:#374151; margin-top:8px;
@@ -1063,87 +1190,10 @@ def render():
                 html {{ font-size:12px; }}
                 .action-val {{ font-size:13px; }}
                 .narrative {{ font-size:10.5px; line-height:1.7; }}
-                .mri-verdict-text {{ font-size:11px; }}
+                .gate-cta {{ font-size:11px; padding:9px 18px; width:100%; }}
               }}
 
-              /* ── MarketRealityBlock ── */
-              .mri-wrap {{
-                background: #080A0D;
-                border: 1px solid #1E2229;
-                border-left: 3px solid #F0A500;
-                border-radius: 8px;
-                padding: 10px 13px;
-                margin: 8px 0;
-              }}
-              .mri-header {{
-                display: flex;
-                align-items: center;
-                justify-content: space-between;
-                margin-bottom: 8px;
-              }}
-              .mri-title {{
-                font-size: 9px;
-                text-transform: uppercase;
-                letter-spacing: 0.09em;
-                color: #4B5563;
-                font-weight: 600;
-              }}
-              .mri-badge {{
-                font-size: 9px;
-                font-weight: 700;
-                padding: 2px 8px;
-                border-radius: 999px;
-                border: 1px solid;
-                letter-spacing: 0.04em;
-                white-space: nowrap;
-              }}
-              .mri-body {{
-                display: flex;
-                flex-direction: column;
-                gap: 5px;
-              }}
-              .mri-line {{
-                font-size: 11px;
-                color: #C8C4BC;
-                line-height: 1.6;
-              }}
-              .mri-line::before {{
-                content: '· ';
-                color: #4B5563;
-              }}
-              .mri-verdict {{
-                margin-top: 6px;
-                padding-top: 7px;
-                border-top: 1px solid #1A1D24;
-                display: flex;
-                flex-direction: column;
-                gap: 2px;
-              }}
-              .mri-verdict-label {{
-                font-size: 9px;
-                text-transform: uppercase;
-                letter-spacing: 0.08em;
-                color: #4B5563;
-              }}
-              .mri-verdict-text {{
-                font-size: 12px;
-                font-weight: 600;
-                line-height: 1.5;
-              }}
-              .mri-no-data {{
-                font-size: 11px;
-                color: #4B5563;
-                line-height: 1.6;
-                font-style: italic;
-              }}
-              .mri-source {{
-                font-size: 9px;
-                color: #374151;
-                margin-top: 7px;
-                padding-top: 5px;
-                border-top: 1px solid #12151A;
-                letter-spacing: 0.02em;
-              }}
+              {MRI_CSS}
             </style>
             <script>
               function resize() {{
@@ -1156,37 +1206,32 @@ def render():
             </head>
             <body>
 
-              <!-- 1. Badge + change row -->
-              <div class="badge-row">
-                <span class="signal-badge">{label}</span>
-                <span class="chg-val">{arrow} {abs(chg):.2f}% today</span>
-                {'<span class="vol-val">' + vol_display + '</span>' if vol_display else ''}
-                <span class="date-val">{score_date}</span>
-              </div>
+              <!-- 1. Badge + change row — only shown on open/paid cards -->
+              {'<div class="badge-row"><span class="signal-badge">' + label + '</span><span class="chg-val">' + arrow + ' ' + str(abs(chg)) + '% today</span>' + ('<span class="vol-val">' + vol_display + '</span>' if vol_display else '') + '<span class="date-val">' + score_date + '</span></div>' if show_verdict else '<div class="badge-row"><span class="chg-val">' + arrow + ' ' + f"{abs(chg):.2f}%" + ' today</span>' + ('<span class="vol-val">' + vol_display + '</span>' if vol_display else '') + '<span class="date-val">' + score_date + '</span></div>'}
 
               <!-- 2. Short DB text -->
-              {f'<div class="db-text">{db_short_display}</div>' if db_short_display else ''}
+              {f'<div class="db-text">{db_short_display}</div>' if db_short_display and show_verdict else ''}
 
-              <!-- 3. Entry / Target / Stop Loss -->
+              <!-- 3. Entry / Target / Stop Loss (paid only) -->
               {f'''<div class="action-grid">
                 <div class="action-cell" style="background:#001A00;border:1px solid #003D00;">
                   <div class="action-lbl">&#10003; Entry</div>
-                  <div class="action-val" style="color:#22C55E;">&#8358;{entry_price:,.2f}</div>
+                  <div class="action-val" style="color:#22C55E;">N{entry_price:,.2f}</div>
                 </div>
                 <div class="action-cell" style="background:#001A1A;border:1px solid #003D3D;">
                   <div class="action-lbl">&#127919; Target</div>
-                  <div class="action-val" style="color:#22D3EE;">&#8358;{target_price:,.2f}</div>
+                  <div class="action-val" style="color:#22D3EE;">N{target_price:,.2f}</div>
                   <div class="action-sub" style="color:#22D3EE;">+{potential}%</div>
                 </div>
                 <div class="action-cell" style="background:#1A0000;border:1px solid #3D0000;">
                   <div class="action-lbl">&#128721; Stop Loss</div>
-                  <div class="action-val" style="color:#EF4444;">&#8358;{stop_loss:,.2f}</div>
+                  <div class="action-val" style="color:#EF4444;">N{stop_loss:,.2f}</div>
                 </div>
               </div>''' if entry_price and target_price and stop_loss else ''}
 
-              <!-- 4. Score bars -->
+              <!-- 4. Score bars (always visible — free users can see these) -->
               <div class="scores">
-                <div class="scores-title">Score Breakdown</div>
+                <div class="scores-title">Score Breakdown — Free to view</div>
                 <div class="scores-grid">
                   <div>
                     <div class="score-lbl">Momentum</div>
@@ -1212,13 +1257,16 @@ def render():
                 </div>
               </div>
 
-              <!-- 5. Market Reality Block (What's Really Driving This) -->
+              <!-- 5. Market Reality Intelligence block (paid only) -->
               {mri_html}
 
-              <!-- 6. Rich narrative -->
-              <div class="narrative">{rich_narrative}</div>
+              <!-- 6. TIER 1 FIX 1: Verdict gate OR full narrative -->
+              {'<div class="narrative">' + narrative_display + '</div>' if show_verdict else _render_locked_verdict_html(symbol, accent, stars_display)}
 
-              <!-- 7. Disclaimer -->
+              <!-- 7. Upgrade lock for free/visitor on open cards (softer CTA) -->
+              {'<div style="background:#0C0A00;border:1px solid rgba(240,165,0,.3);border-radius:8px;padding:10px 12px;margin-top:8px;text-align:center;font-family:DM Mono,monospace;font-size:11px;color:#9CA3AF;">🔒 <strong style="color:#F0A500;">Start Free 14-Day Trial:</strong> entry price · target · stop-loss · full AI analysis · Market Intelligence</div>' if not is_paid and show_verdict else ''}
+
+              <!-- 8. Disclaimer -->
               <div class="disclaimer">
                 &#9888;&#65039; Signal scores are educational only —
                 not financial advice. Always do your own research.
@@ -1228,5 +1276,25 @@ def render():
             </html>
             """, height=card_height, scrolling=True)
 
-            # ── Inline alert widget ──────────────────────────
-            render_alert_widget(sb, user, plan, symbol, price, alerts_by_symbol)
+            if is_paid:
+                render_alert_widget(sb, user, plan, symbol, price, alerts_by_symbol)
+
+    # ── SEO FOOTER ────────────────────────────────────────────────────────────
+    st.markdown(f"""
+    <div style="font-family:DM Mono,monospace;font-size:11px;color:#374151;
+                margin-top:24px;padding-top:12px;border-top:1px solid #1E2229;line-height:1.8;">
+      <strong style="color:#4B5563;">About NGX Signal Scores:</strong>
+      Daily AI-generated momentum, volume and composite scores for all {len(all_scores)} stocks listed on the
+      Nigerian Exchange (NGX). Each signal is scored across three dimensions — momentum, volume
+      and composite market data — and updated after every trading session.
+      Signals are available for Banking stocks (ZENITHBANK BUY signal, GTCO signal today,
+      UBA signal, ACCESSCORP, FBNH), Telecoms (MTNN signal, AIRTELAFRI),
+      Consumer Goods (NESTLE, DANGSUGAR, GUINNESS), Cement (DANGCEM, BUACEMENT, WAPCO),
+      Oil &amp; Gas (SEPLAT, TOTAL, CONOIL), Insurance, Agriculture and all other NGX sectors.
+      Free users see score bars, price data and sector information.
+      Start a free 14-day trial to unlock signal direction (BUY/HOLD/AVOID),
+      entry prices, targets, stop-losses and full AI analysis.
+      All signals are educational only — not financial advice. Always do your own research
+      before investing.
+    </div>
+    """, unsafe_allow_html=True)
