@@ -2,7 +2,7 @@ import os
 from supabase import create_client
 from signal_engine import run_batch
 
-url = os.environ.get("SUPABASE_URL")
+url = os.environ.get(https://nzctjawtypodearttldh.supabase.co)
 key = os.environ.get("SUPABASE_KEY")
 
 if not url or not key:
