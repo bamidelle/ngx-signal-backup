@@ -2,6 +2,62 @@ import streamlit as st
 from app.utils.supabase_client import get_supabase
 from app.components.inline_alert_widget import load_user_alerts, render_alert_widget, _bell_label
 from app.utils.webpushr import maybe_push_signal
+from app.views.global_pulse import render_global_pulse_strip, get_global_pulse, get_sector_global_context
+
+# ── Gold Farm sync (silent — never crashes signals page) ─────────────────────
+try:
+    from app.utils.gold_farm_sync import sync_signals_to_gold_farm, sync_daily_summary
+    _GOLD_FARM_AVAILABLE = True
+except ImportError:
+    _GOLD_FARM_AVAILABLE = False
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CACHED DATA LOADERS
+# ══════════════════════════════════════════════════════════════════════════════
+
+@st.cache_resource
+def _get_sb():
+    """Supabase client — one connection shared across all rerenders."""
+    return get_supabase()
+
+
+@st.cache_data(ttl=180)
+def _load_signals_and_prices():
+    """
+    Fetches signal scores + latest prices for all symbols.
+    Cached for 3 minutes — signals update after market close but we want
+    near-real-time price changes to show through reasonably quickly.
+    Returns: (all_scores list, price_map dict)
+    """
+    sb = _get_sb()
+
+    scores_res = sb.table("signal_scores") \
+        .select("*") \
+        .order("score_date", desc=True) \
+        .order("stars", desc=True) \
+        .limit(500).execute()
+
+    prices_res = sb.table("stock_prices") \
+        .select("symbol, price, change_percent, volume") \
+        .order("trading_date", desc=True) \
+        .limit(500).execute()
+
+    # Build price map — latest price per symbol
+    price_map = {}
+    for p in (prices_res.data or []):
+        if p["symbol"] not in price_map:
+            price_map[p["symbol"]] = p
+
+    # Deduplicate signals — keep latest per symbol
+    seen = set()
+    all_scores = []
+    for s in (scores_res.data or []):
+        if s["symbol"] not in seen:
+            seen.add(s["symbol"])
+            all_scores.append(s)
+
+    return all_scores, price_map
 
 SIGNAL_CONFIG = {
     "STRONG_BUY":     ("#16A34A", "⭐⭐⭐⭐⭐", "STRONG BUY"),
@@ -706,12 +762,27 @@ def generate_trending_sentiment_tag(
 
 
 def render():
-    sb = get_supabase()
+    sb = _get_sb()
 
     profile  = st.session_state.get("profile", {})
     plan     = (profile.get("plan") or "free").lower().strip()
     user     = st.session_state.get("user")
     alerts_by_symbol = load_user_alerts(sb, user)
+
+    # ── Gold Farm sync — once per day, silent, never blocks render ────────────
+    if _GOLD_FARM_AVAILABLE:
+        from datetime import date as _date
+        _gf_key = f"_gf_synced_{_date.today().isoformat()}"
+        if not st.session_state.get(_gf_key):
+            try:
+                sync_signals_to_gold_farm(sb)
+                sync_daily_summary(sb)
+                st.session_state[_gf_key] = True
+            except Exception:
+                pass  # never crash the signals page
+
+    # ── FETCH signals + prices (cached 3 min) ─────────
+    all_scores, price_map = _load_signals_and_prices()
 
     # ── Tier detection ────────────────────────────────
     TIER_ORDER = ["visitor", "free", "trial", "starter", "trader", "pro"]
@@ -761,6 +832,10 @@ def render():
     </div>
     """, unsafe_allow_html=True)
 
+    # ── GLOBAL PULSE — slim context bar (all tiers) ────────────────────────
+    if _gp:
+        render_global_pulse_strip(tier, location="signals")
+
     # ── FILTERS ──────────────────────────────────────
     col1, col2, col3 = st.columns(3)
     with col1:
@@ -784,31 +859,23 @@ def render():
             key="sig_search"
         ).upper().strip()
 
-    # ── FETCH ─────────────────────────────────────────
-    scores_res = sb.table("signal_scores")\
-        .select("*")\
-        .order("score_date", desc=True)\
-        .order("stars", desc=True)\
-        .limit(500).execute()
+    # ── GLOBAL PULSE — fetch once for slim bar + per-card context ──────────
+    _gp = None
+    _gp_oil_chg = 0.0
+    _gp_dxy_chg = 0.0
+    _gp_btc_chg = 0.0
+    _gp_fg_score = 50.0
+    try:
+        _gp = get_global_pulse()
+        if _gp:
+            _gp_oil_chg  = _gp["data"].get("oil", {}).get("change_pct", 0.0)
+            _gp_dxy_chg  = _gp["data"].get("dxy", {}).get("change_pct", 0.0)
+            _gp_btc_chg  = _gp["data"].get("btc", {}).get("change_pct", 0.0)
+            _gp_fg_score = _gp["data"].get("fg", {}).get("score", 50.0)
+    except Exception:
+        pass  # never crash the signals page
 
-    prices_res = sb.table("stock_prices")\
-        .select("symbol, price, change_percent, volume")\
-        .order("trading_date", desc=True)\
-        .limit(500).execute()
-
-    price_map = {}
-    for p in (prices_res.data or []):
-        if p["symbol"] not in price_map:
-            price_map[p["symbol"]] = p
-
-    # Deduplicate signals — keep latest per symbol
-    seen = set()
-    all_scores = []
-    for s in (scores_res.data or []):
-        if s["symbol"] not in seen:
-            seen.add(s["symbol"])
-            all_scores.append(s)
-
+    # ── APPLY FILTERS (data already loaded via cache above) ──────────────────
     label_to_code = {
         "STRONG BUY": "STRONG_BUY",
         "BUY": "BUY",
@@ -1015,6 +1082,18 @@ def render():
             mri_html     = ""
             mri_text_len = 0
 
+        # ── Global context for this card sector (paid only, dict lookup — near zero cost) ──
+        _card_sector = s.get("sector", "") or price_map.get(symbol, {}).get("sector", "") or ""
+        _card_global_ctx = ""
+        if show_full_nar and _gp and _card_sector:
+            try:
+                _card_global_ctx = get_sector_global_context(
+                    _card_sector, _gp_oil_chg, _gp_dxy_chg,
+                    _gp_btc_chg, _gp_fg_score
+                )
+            except Exception:
+                _card_global_ctx = ""
+
         # ── Dynamic height calculation ─────────────────────────────────────
         # Estimate rendered lines for each content block at ~55 chars/line on mobile
         CHARS_PER_LINE = 55
@@ -1036,15 +1115,17 @@ def render():
         if is_paid:
             h_mri       = est_height(mri_text_len * "x", 11, 1.6) + 60
             h_narrative = est_height(rich_narrative, 11, 1.75)
+            h_global    = est_height(_card_global_ctx, 10, 1.55) + 10 if _card_global_ctx else 0
             h_lock_box  = 0
         else:
             h_mri       = 0
             h_narrative = 0
+            h_global    = 0
             h_lock_box  = 240   # blurred badge + lock msg + 2 CTA buttons + subtext
 
         card_height = (
             h_badge + h_db_short + h_action +
-            h_scores + h_mri + h_narrative + h_lock_box + h_disclaimer + h_padding
+            h_scores + h_mri + h_narrative + h_global + h_lock_box + h_disclaimer + h_padding
         )
         # Clamp: never shorter than 320px, never taller than 1400px
         card_height = max(320, min(card_height, 1400))
@@ -1374,7 +1455,10 @@ def render():
               <!-- 6b. Rich narrative — paid only -->
               {f'<div class="narrative">{rich_narrative}</div>' if show_full_nar else ''}
 
-              <!-- 7. Disclaimer -->
+              <!-- 7. Global Context — paid only -->
+              {f'<div style="background:#080A0D;border:1px solid #1E2229;border-left:2px solid #3B82F6;border-radius:6px;padding:8px 11px;margin-top:6px;font-family:DM Mono,monospace;font-size:10px;color:#9CA3AF;line-height:1.55;">' + _card_global_ctx + '</div>' if _card_global_ctx else ''}
+
+              <!-- 8. Disclaimer -->
               <div class="disclaimer">
                 &#9888;&#65039; Signal scores are educational only —
                 not financial advice. Always do your own research.
