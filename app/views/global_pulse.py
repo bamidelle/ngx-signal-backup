@@ -721,54 +721,58 @@ def render_global_pulse_strip(tier: str, location: str = "home") -> None:
     if not tiles:
         return
 
-    # ── Premium tile renderer ──────────────────────────────────────────────────
+    # ══════════════════════════════════════════════════════════════════════════
+    # PREMIUM TILE RENDERER  — Bloomberg/TradingView fintech standard
+    # Numbers dominate. Labels whisper. Cards stay tight.
+    # ══════════════════════════════════════════════════════════════════════════
     def _tile_html(t: dict) -> str:
-        border_col   = t["border"]
-        sub_html     = ""
-        if t["sub"]:
-            sub_color = "#22C55E" if t["label"] == "BITCOIN" else "#6B7280"
-            sub_html  = (
-                f'<div class="ngx-sub" style="color:{sub_color};">' +
-                t["sub"] + '</div>'
-            )
+        border_col = t["border"]
+
+        # ── Naira sub-value (BTC only, shown in green) ─────────────────────
+        sub_html = ""
+        if t.get("sub"):
+            sub_color = "#22C55E" if t["label"] == "BITCOIN" else "#9CA3AF"
+            sub_html  = f'<div class="ngx-sub" style="color:{sub_color};">{t["sub"]}</div>'
+
+        # ── Impact text (paid = plain English, free = upgrade prompt) ──────
         if is_paid:
-            impact_html = (
-                f'<div class="ngx-impact">{t["impact"]}</div>'
-            )
+            impact_html = f'<div class="ngx-impact">{t["impact"]}</div>'
         else:
             impact_html = '<div class="ngx-impact ngx-impact-locked">🔒 Upgrade to unlock Naira impact</div>'
 
         return (
-            f'<div class="ngx-card" style="border-top-color:{border_col};">' +
-            f'  <div class="ngx-label">{t["label"]}</div>' +
-            f'  <div class="ngx-price-xl" style="color:#FFFFFF;">{t["value"]}</div>' +
-            sub_html +
-            f'  <div class="ngx-pct" style="color:{t["color"]};">{t["change"]}</div>' +
-            impact_html +
-            '</div>'
+            f'<div class="ngx-card" style="border-top-color:{border_col};">'
+            f'  <div class="ngx-card-top">'
+            f'    <div class="ngx-label">{t["label"]}</div>'
+            f'    <div class="ngx-price-xl" style="color:#FFFFFF;">{t["value"]}</div>'
+            f'    {sub_html}'
+            f'    <div class="ngx-pct" style="color:{t["color"]};">{t["change"]}</div>'
+            f'  </div>'
+            f'  {impact_html}'
+            f'</div>'
         )
 
     tiles_html = "\n".join(_tile_html(t) for t in tiles)
 
     # ── Summary section ────────────────────────────────────────────────────────
     if is_paid:
-        summary   = impacts.get("summary", "")
-        source    = impacts.get("source", "rules")
-        ai_badge  = (
+        summary  = impacts.get("summary", "")
+        source   = impacts.get("source", "rules")
+        ai_badge = (
             '<span class="gp-ai-badge">✦ AI</span>'
             if source in ("gemini", "groq") else ""
         )
         summary_section = (
-            f'<div class="gp-summary">' +
-            f'  <span class="gp-summary-label">Today\'s NGX Context {ai_badge}</span>' +
-            f'  <div class="gp-summary-text">{summary}</div>' +
-            '</div>'
+            f'<div class="gp-summary">'
+            f'  <span class="gp-summary-label">Today\'s NGX Context {ai_badge}</span>'
+            f'  <div class="gp-summary-text">{summary}</div>'
+            f'</div>'
         )
     else:
         summary_section = (
-            '<div class="gp-upgrade">' +
-            '🔒 <strong style="color:#F0A500;">Upgrade to Starter</strong> — ' +
-            'unlock what these global signals mean for your Naira and NGX portfolio' +
+            '<div class="gp-upgrade">'
+            '🔒 <strong style="color:#F0A500;">Upgrade to Starter</strong> — '
+            'unlock what these global signals mean for your Naira and NGX portfolio'
             '</div>'
         )
 
@@ -776,9 +780,13 @@ def render_global_pulse_strip(tier: str, location: str = "home") -> None:
 
     st.markdown(f"""
 <style>
-@import url('https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=Syne:wght@700;800&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500;600&family=Syne:wght@700;800&display=swap');
 
-/* ── Global Pulse wrapper ── */
+/* ════════════════════════════════════════════════
+   GLOBAL PULSE — Premium Fintech Layout
+   Scope: .gp-wrap and descendants only
+   ════════════════════════════════════════════════ */
+
 .gp-wrap {{
   margin: 14px 0 4px 0;
 }}
@@ -803,12 +811,13 @@ def render_global_pulse_strip(tier: str, location: str = "home") -> None:
   font-family: 'DM Mono', monospace;
   font-size: 9px;
   color: #2D3748;
+  white-space: nowrap;
 }}
 .gp-subtitle {{
   font-family: 'DM Mono', monospace;
   font-size: 10px;
   color: #4B5563;
-  margin-bottom: 8px;
+  margin-bottom: 7px;
   line-height: 1.5;
 }}
 
@@ -817,7 +826,7 @@ def render_global_pulse_strip(tier: str, location: str = "home") -> None:
   display: flex;
   flex-wrap: wrap;
   gap: 4px;
-  margin-bottom: 10px;
+  margin-bottom: 9px;
 }}
 .gp-pill {{
   font-family: 'DM Mono', monospace;
@@ -830,60 +839,70 @@ def render_global_pulse_strip(tier: str, location: str = "home") -> None:
   white-space: nowrap;
 }}
 
-/* ── Tile grid ── */
+/* ── 2×2 tile grid ── */
 .gp-grid {{
   display: grid;
   grid-template-columns: repeat(2, 1fr);
-  gap: 8px;
-  margin-bottom: 0;
+  gap: 7px;
 }}
 
-/* ── Individual card ── */
+/* ════════════════════════════════════════════════
+   INDIVIDUAL TILE — Data-First Design
+   Hierarchy: label (whisper) → price (dominant) → change
+   ════════════════════════════════════════════════ */
 .ngx-card {{
-  background: #07090C;
-  border: 1px solid #1A1D24;
-  border-top: 2px solid #374151;   /* overridden inline per card */
+  background: #06080B;
+  border: 1px solid #181B22;
+  border-top: 2px solid #374151;   /* overridden inline */
   border-radius: 10px;
-  padding: 10px 12px 8px 12px;
+  padding: 10px 11px 8px 11px;
   display: flex;
   flex-direction: column;
   justify-content: space-between;
-  min-height: 100px;
-  max-height: 110px;
-  overflow: hidden;
   box-sizing: border-box;
-  position: relative;
+  overflow: hidden;
+  /* No fixed height — let content breathe naturally */
+  min-height: 95px;
 }}
 
-/* ── Label (de-emphasised) ── */
+/* Top section: label + number + change stacked tight */
+.ngx-card-top {{
+  display: flex;
+  flex-direction: column;
+  gap: 0px;
+}}
+
+/* ── Label — small, muted, all-caps ── */
 .ngx-label {{
   font-family: 'DM Mono', monospace;
-  font-size: 9px;
+  font-size: 8.5px;
   font-weight: 500;
-  color: #4B5563;
+  color: #374151;
   text-transform: uppercase;
-  letter-spacing: 0.1em;
+  letter-spacing: 0.12em;
   line-height: 1;
-  margin-bottom: 2px;
+  margin-bottom: 4px;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
 }}
 
-/* ── Primary number (dominant) ── */
+/* ── Primary price number — DOMINANT ── */
 .ngx-price-xl {{
   font-family: 'DM Mono', monospace;
-  font-size: 28px;
+  font-size: clamp(22px, 5.5vw, 32px);
   font-weight: 600;
   line-height: 1;
   letter-spacing: -0.04em;
+  color: #FFFFFF;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
-  transform: scale(1.04);
-  transform-origin: left center;
   display: block;
-  margin-bottom: 1px;
+  margin-bottom: 2px;
+  /* Subtle scale lift — does not affect layout */
+  transform: scaleX(1.02);
+  transform-origin: left center;
 }}
 
 /* ── BTC Naira sub-value ── */
@@ -896,56 +915,57 @@ def render_global_pulse_strip(tier: str, location: str = "home") -> None:
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
-  margin-bottom: 2px;
+  margin-bottom: 3px;
 }}
 
-/* ── Change % ── */
+/* ── % Change row ── */
 .ngx-pct {{
   font-family: 'DM Mono', monospace;
-  font-size: 13px;
+  font-size: 12px;
   font-weight: 600;
   line-height: 1;
-  letter-spacing: -0.01em;
+  letter-spacing: 0em;
   white-space: nowrap;
+  margin-top: 1px;
 }}
 
-/* ── Impact text ── */
+/* ── Naira impact text (paid) ── */
 .ngx-impact {{
   font-family: 'DM Mono', monospace;
-  font-size: 9.5px;
-  color: #6B7280;
-  line-height: 1.45;
-  margin-top: 5px;
-  padding-top: 5px;
-  border-top: 1px solid #12151A;
+  font-size: 9px;
+  color: #4B5563;
+  line-height: 1.4;
+  margin-top: 7px;
+  padding-top: 6px;
+  border-top: 1px solid #0F1218;
   display: -webkit-box;
   -webkit-line-clamp: 2;
   -webkit-box-orient: vertical;
   overflow: hidden;
 }}
 .ngx-impact-locked {{
-  color: #374151;
-  font-size: 9px;
+  color: #2D3748;
+  font-size: 8.5px;
 }}
 
 /* ── Summary block ── */
 .gp-summary {{
-  background: #070A0D;
-  border: 1px solid #1A1D24;
+  background: #060910;
+  border: 1px solid #181B22;
   border-left: 3px solid #F0A500;
   border-radius: 8px;
   padding: 10px 13px;
-  margin-top: 9px;
+  margin-top: 8px;
 }}
 .gp-summary-label {{
   font-family: 'DM Mono', monospace;
-  font-size: 9px;
+  font-size: 8.5px;
   color: #F0A500;
   text-transform: uppercase;
-  letter-spacing: 0.1em;
+  letter-spacing: 0.11em;
   font-weight: 600;
   display: block;
-  margin-bottom: 4px;
+  margin-bottom: 5px;
 }}
 .gp-summary-text {{
   font-family: 'DM Mono', monospace;
@@ -954,20 +974,55 @@ def render_global_pulse_strip(tier: str, location: str = "home") -> None:
   line-height: 1.65;
 }}
 .gp-ai-badge {{
-  font-size: 9px;
+  font-size: 8.5px;
   color: #22C55E;
-  margin-left: 5px;
+  margin-left: 4px;
 }}
 .gp-upgrade {{
   background: #0A0800;
-  border: 1px solid rgba(240,165,0,.12);
+  border: 1px solid rgba(240,165,0,.1);
   border-radius: 8px;
   padding: 9px 13px;
-  margin-top: 9px;
+  margin-top: 8px;
   font-family: 'DM Mono', monospace;
   font-size: 11px;
   color: #6B7280;
   text-align: center;
+}}
+
+/* ════════════════════════════════════════════════
+   RESPONSIVE — mobile-first number scaling
+   ════════════════════════════════════════════════ */
+@media (max-width: 480px) {{
+  .ngx-price-xl {{
+    font-size: clamp(20px, 7vw, 28px);
+    letter-spacing: -0.03em;
+  }}
+  .ngx-pct {{
+    font-size: 11px;
+  }}
+  .ngx-label {{
+    font-size: 8px;
+  }}
+  .ngx-impact {{
+    font-size: 8.5px;
+  }}
+  .gp-grid {{
+    gap: 6px;
+  }}
+}}
+
+@media (min-width: 900px) {{
+  .ngx-price-xl {{
+    font-size: 34px;
+    letter-spacing: -0.05em;
+  }}
+  .ngx-pct {{
+    font-size: 13px;
+  }}
+  .gp-grid {{
+    grid-template-columns: repeat(4, 1fr);
+  }}
 }}
 </style>
 
