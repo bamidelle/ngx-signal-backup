@@ -26,6 +26,112 @@ import hashlib
 from datetime import date, datetime, timedelta
 from app.utils.supabase_client import get_supabase
 from app.views.signals import generate_trending_sentiment_tag
+from app.views.global_pulse import render_global_pulse_strip, get_global_pulse, get_global_pulse_for_ai
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CACHED DATA LOADERS  — prevent repeated DB hits on every Streamlit rerender
+# ══════════════════════════════════════════════════════════════════════════════
+
+@st.cache_resource
+def _get_sb():
+    """Supabase client — created once, reused forever. Never re-connects on rerender."""
+    return get_supabase()
+
+
+@st.cache_data(ttl=300)
+def _load_home_prices():
+    """
+    Latest stock prices for all symbols — cached 5 minutes.
+    Replaces get_all_latest_prices(sb) which ran on every render.
+    Returns: (raw_prices list, latest_date str)
+    """
+    sb = _get_sb()
+    res = sb.table("stock_prices").select(
+        "symbol,price,change_percent,volume,trading_date"
+    ).order("trading_date", desc=True).limit(500).execute()
+    prices = res.data or []
+    latest = prices[0]["trading_date"] if prices else str(date.today())
+    if len(prices) < 50:
+        broad = sb.table("stock_prices").select(
+            "symbol,price,change_percent,volume,trading_date"
+        ).order("trading_date", desc=True).limit(5000).execute()
+        sym_map = {}
+        for p in (broad.data or []):
+            s = p.get("symbol", "")
+            if s and s not in sym_map:
+                sym_map[s] = p
+        existing = {p["symbol"] for p in prices}
+        prices += [p for s, p in sym_map.items() if s not in existing]
+    return prices, latest
+
+
+@st.cache_data(ttl=300)
+def _load_home_market_summary():
+    """Market summary (ASI, gainers/losers) — cached 5 minutes."""
+    sb = _get_sb()
+    res = sb.table("market_summary").select("*").order("trading_date", desc=True).limit(1).execute()
+    return res.data[0] if res.data else {}
+
+
+@st.cache_data(ttl=180)
+def _load_home_signals():
+    """Top signal scores — cached 3 minutes."""
+    sb = _get_sb()
+    res = sb.table("signal_scores").select(
+        "symbol,signal,stars,reasoning"
+    ).order("score_date", desc=True).order("stars", desc=True).limit(50).execute()
+    return res.data or []
+
+
+@st.cache_data(ttl=180)
+def _load_home_trending_signals():
+    """Broader signal list for trending section — cached 3 minutes."""
+    sb = _get_sb()
+    res = sb.table("signal_scores").select(
+        "symbol,signal,stars,momentum_score,volume_score,news_score"
+    ).order("score_date", desc=True).limit(200).execute()
+    return res.data or []
+
+
+@st.cache_data(ttl=120)
+def _load_home_news():
+    """Latest news headlines — cached 2 minutes."""
+    sb = _get_sb()
+    res = sb.table("news").select(
+        "headline,sentiment,scraped_at"
+    ).order("scraped_at", desc=True).limit(20).execute()
+    return res.data or []
+
+
+@st.cache_data(ttl=300)
+def _load_home_sectors():
+    """Sector performance — cached 5 minutes."""
+    sb = _get_sb()
+    res = sb.table("sector_performance").select(
+        "sector_name,traffic_light,change_percent,verdict"
+    ).order("change_percent", desc=True).execute()
+    return res.data or []
+
+
+@st.cache_data(ttl=300)
+def _load_home_leaderboard():
+    """Leaderboard snapshots — cached 5 minutes."""
+    sb = _get_sb()
+    res = sb.table("leaderboard_snapshots").select(
+        "display_name,return_percent,user_id"
+    ).order("return_percent", desc=True).limit(5).execute()
+    return res.data or []
+
+
+@st.cache_data(ttl=300)
+def _load_home_briefs():
+    """AI morning brief — cached 5 minutes."""
+    sb = _get_sb()
+    res = sb.table("ai_briefs").select("body,brief_date") \
+        .eq("language", "en").eq("brief_type", "morning") \
+        .order("brief_date", desc=True).limit(1).execute()
+    return res.data or []
 
 try:
     import pytz
@@ -129,138 +235,6 @@ _LOCK_COPY: dict[str, dict] = {
         "cta": "Start Free Trial →",
     },
 }
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# CACHED DB FETCHERS
-# All raw Supabase calls in home.py are wrapped here with @st.cache_data.
-# This means every navigation rerun, AI chat interaction, and button click
-# hits the cache instead of the database — eliminating perceived lag.
-#
-# TTL strategy:
-#   prices       → 300s  (5 min)  — market data refreshes intraday
-#   signals      → 300s  (5 min)  — signal scores update daily but cache is safe
-#   news         → 600s  (10 min) — headlines don't change by the second
-#   sectors      → 600s  (10 min) — sector data is slow-moving
-#   market_sum   → 300s  (5 min)  — ASI index needs to feel fresh
-#   leaderboard  → 120s  (2 min)  — game rankings change more frequently
-# ══════════════════════════════════════════════════════════════════════════════
-
-@st.cache_data(ttl=300, show_spinner=False)
-def _home_get_latest_prices() -> tuple:
-    """Cached wrapper for the two-phase stock price fetch. Returns (prices, latest_date)."""
-    from app.utils.supabase_client import get_supabase as _gsb
-    sb = _gsb()
-    res = sb.table("stock_prices").select(
-        "symbol,price,change_percent,volume,trading_date"
-    ).order("trading_date", desc=True).limit(500).execute()
-    prices = res.data or []
-    latest = prices[0]["trading_date"] if prices else str(date.today())
-    if len(prices) < 50:
-        broad = sb.table("stock_prices").select(
-            "symbol,price,change_percent,volume,trading_date"
-        ).order("trading_date", desc=True).limit(5000).execute()
-        sym_map = {}
-        for p in (broad.data or []):
-            s = p.get("symbol", "")
-            if s and s not in sym_map:
-                sym_map[s] = p
-        existing = {p["symbol"] for p in prices}
-        prices += [p for s, p in sym_map.items() if s not in existing]
-    return prices, latest
-
-
-@st.cache_data(ttl=300, show_spinner=False)
-def _home_get_market_summary() -> dict:
-    """Cached ASI / market summary row. TTL 5 min."""
-    from app.utils.supabase_client import get_supabase as _gsb
-    try:
-        res = _gsb().table("market_summary").select("*")\
-            .order("trading_date", desc=True).limit(1).execute()
-        return res.data[0] if res.data else {}
-    except Exception:
-        return {}
-
-
-@st.cache_data(ttl=600, show_spinner=False)
-def _home_get_ai_brief() -> list:
-    """Cached AI morning brief rows. TTL 10 min."""
-    from app.utils.supabase_client import get_supabase as _gsb
-    try:
-        res = _gsb().table("ai_briefs").select("body,brief_date")\
-            .eq("language", "en").eq("brief_type", "morning")\
-            .order("brief_date", desc=True).limit(1).execute()
-        return res.data or []
-    except Exception:
-        return []
-
-
-@st.cache_data(ttl=300, show_spinner=False)
-def _home_get_signal_scores_top(limit: int = 50) -> list:
-    """Top signal scores for insight cards (symbol, signal, stars, reasoning). TTL 5 min."""
-    from app.utils.supabase_client import get_supabase as _gsb
-    try:
-        res = _gsb().table("signal_scores")\
-            .select("symbol,signal,stars,reasoning")\
-            .order("score_date", desc=True)\
-            .order("stars", desc=True)\
-            .limit(limit).execute()
-        return res.data or []
-    except Exception:
-        return []
-
-
-@st.cache_data(ttl=300, show_spinner=False)
-def _home_get_signal_scores_full(limit: int = 200) -> list:
-    """Full signal scores for trending map (includes sub-scores). TTL 5 min."""
-    from app.utils.supabase_client import get_supabase as _gsb
-    try:
-        res = _gsb().table("signal_scores")\
-            .select("symbol,signal,stars,momentum_score,volume_score,news_score")\
-            .order("score_date", desc=True)\
-            .limit(limit).execute()
-        return res.data or []
-    except Exception:
-        return []
-
-
-@st.cache_data(ttl=600, show_spinner=False)
-def _home_get_news() -> list:
-    """Cached market news headlines. TTL 10 min."""
-    from app.utils.supabase_client import get_supabase as _gsb
-    try:
-        res = _gsb().table("news")\
-            .select("headline,sentiment,scraped_at")\
-            .order("scraped_at", desc=True).limit(20).execute()
-        return res.data or []
-    except Exception:
-        return []
-
-
-@st.cache_data(ttl=600, show_spinner=False)
-def _home_get_sectors() -> list:
-    """Cached sector performance rows. TTL 10 min."""
-    from app.utils.supabase_client import get_supabase as _gsb
-    try:
-        res = _gsb().table("sector_performance")\
-            .select("sector_name,traffic_light,change_percent,verdict")\
-            .order("change_percent", desc=True).execute()
-        return res.data or []
-    except Exception:
-        return []
-
-
-@st.cache_data(ttl=120, show_spinner=False)
-def _home_get_leaderboard() -> list:
-    """Cached leaderboard top-5. TTL 2 min."""
-    from app.utils.supabase_client import get_supabase as _gsb
-    try:
-        res = _gsb().table("leaderboard_snapshots")\
-            .select("display_name,return_percent,user_id")\
-            .order("return_percent", desc=True).limit(5).execute()
-        return res.data or []
-    except Exception:
-        return []
 
 
 def get_user_tier() -> str:
@@ -512,7 +486,7 @@ def _classify_query(question: str) -> str:
 
 def _build_ai_system_prompt(
     tier, ad, aarr, acg, mood, gc, lc, total,
-    top_g_text, latest_date, market_open, question="",
+    top_g_text, latest_date, market_open, question="", **kwargs
 ) -> str:
     query_mode = _classify_query(question)
     persona = """You are NGX Signal AI — a smart, practical financial assistant built specifically for Nigerian stock traders.
@@ -526,13 +500,17 @@ YOUR COMMUNICATION RULES (non-negotiable):
 6. Do NOT sound like a generic AI. Sound like a knowledgeable Nigerian market expert.
 
 """
+    # Accept optional global_context kwarg
+    global_context = kwargs.get("global_context", "") if kwargs else ""
     market_ctx = (
         f"LIVE MARKET DATA (as of {latest_date}):\n"
         f"- NGX All-Share Index: {ad} ({aarr}{abs(acg):.2f}%)\n"
         f"- Market: {'Open now' if market_open else 'Closed (last close data)'}\n"
         f"- Mood: {mood} | Gainers: {gc} | Losers: {lc} | Total tracked: {total}\n"
-        f"- Top movers today: {top_g_text or 'None yet'}\n\n"
+        f"- Top movers today: {top_g_text or 'None yet'}\n"
     )
+    if global_context:
+        market_ctx += global_context + "\n"
     if query_mode == "decision":
         decision_rule = (
             "CRITICAL INSTRUCTION — DECISION MODE ACTIVE:\n"
@@ -1517,6 +1495,7 @@ def _render_ai_section(tier, is_visitor, is_free, is_trial, is_starter, is_pro, 
             tier_prompt_args["total"], tier_prompt_args["top_g_text"],
             tier_prompt_args["latest_date"], tier_prompt_args["market_open"],
             question=question,
+            global_context=tier_prompt_args.get("global_context", ""),
         )
         st.session_state.mai_history.append({"role":"user","content":question})
         with st.spinner("✨ Analysing..."):
@@ -1588,11 +1567,11 @@ def _render_news_section(tier, sb, market, today):
     """Latest Market News"""
     with st.expander("📰  LATEST MARKET NEWS", expanded=False):
         st.markdown('<div class="sec-intro">🟢 Positive — buying opportunities. 🔴 Negative — possible pressure.</div>', unsafe_allow_html=True)
-        news_data = _home_get_news()
-        if news_data:
+        news_res_data = _load_home_news()
+        if news_res_data:
             _nvis = 12 if can_access("news_full",tier) else 4
             seen_h = set(); cnt = 0
-            for art in news_data:
+            for art in news_res_data:
                 hk = (art.get("headline") or "")[:60].lower()
                 if hk in seen_h or cnt >= 12: continue
                 seen_h.add(hk); cnt += 1
@@ -1617,10 +1596,10 @@ def _render_sector_snapshot(tier, sb):
     """Sector snapshot"""
     with st.expander("🚦  SECTOR SNAPSHOT", expanded=False):
         st.markdown('<div class="sec-intro">🟢 Bullish — consider. 🟡 Mixed — wait. 🔴 Weakening — caution.</div>', unsafe_allow_html=True)
-        sec_data = _home_get_sectors()
-        if sec_data:
+        sec_res_data = _load_home_sectors()
+        if sec_res_data:
             seen_s = {}
-            for s in sec_data:
+            for s in sec_res_data:
                 sn = s.get("sector_name","").strip()
                 if sn and sn not in seen_s: seen_s[sn] = s
             all_sec = sorted(seen_s.values(), key=lambda x:float(x.get("change_percent",0) or 0), reverse=True)
@@ -1648,7 +1627,8 @@ def _render_trade_game(sb, current_user):
     """NGX Trade Game leaderboard"""
     st.markdown('<div class="sec-title">🎮 NGX Trade Game</div>', unsafe_allow_html=True)
     st.markdown('<div class="sec-intro">Practice with <strong style="color:#F0A500;">N1,000,000 virtual cash</strong> — real NGX stocks, zero real money risk.</div>', unsafe_allow_html=True)
-    board     = _home_get_leaderboard(); medals = ["🥇","🥈","🥉"]
+    board_res_data = _load_home_leaderboard()
+    board     = board_res_data; medals = ["🥇","🥈","🥉"]
     if board:
         for i, e in enumerate(board[:5]):
             ret = float(e.get("return_percent",0) or 0); dn = (e.get("display_name") or "Investor")[:22]
@@ -1804,9 +1784,9 @@ def _render_pro_command_center(tier, insights, uniq, _sig_map, market, now, top_
     # Market context from sector + mood
     _top_sector = ""
     try:
-        _sec_data_pcc = _home_get_sectors()
-        if _sec_data_pcc:
-            _ts = _sec_data_pcc[0]
+        _sec_r_data = _load_home_sectors()
+        if _sec_r_data:
+            _ts = _sec_r_data[0]
             _top_sector = f"{_ts['sector_name']} stocks are attracting strong attention today. "
     except Exception:
         pass
@@ -2230,7 +2210,7 @@ def render():
             st.rerun()
         return   # stop — don't render the rest of the homepage
 
-    sb           = get_supabase()
+    sb           = _get_sb()
     profile      = st.session_state.get("profile", {})
     current_user = st.session_state.get("user")
     market       = get_market_status()
@@ -2381,8 +2361,8 @@ def render():
         st.markdown('<div style="text-align:center;font-family:DM Mono,monospace;font-size:10px;color:#505050;margin-bottom:8px;">No credit card needed · Cancel anytime</div>', unsafe_allow_html=True)
 
     # ── DATA ──────────────────────────────────────────────────────────────────
-    # ── PERFORMANCE: all DB calls below use @st.cache_data — zero re-fetch on rerun ──
-    raw, latest_date = _home_get_latest_prices()
+    # ── DATA (all cached — no raw DB calls on rerender) ─────────────────────
+    raw, latest_date = _load_home_prices()
     seen = set(); uniq = []
     for p in raw:
         s = p.get("symbol","")
@@ -2390,7 +2370,7 @@ def render():
     total   = len(uniq)
     gainers = sum(1 for p in uniq if float(p.get("change_percent") or 0) > 0)
     losers  = sum(1 for p in uniq if float(p.get("change_percent") or 0) < 0)
-    sm      = _home_get_market_summary()
+    sm      = _load_home_market_summary()
     asi     = float(sm.get("asi_index",0) or 0)
     acg     = float(sm.get("asi_change_percent",0) or 0)
     gc      = gainers if total > 5 else int(sm.get("gainers_count",0) or 0)
@@ -2402,24 +2382,34 @@ def render():
                         ("Neutral","#F0A500","🟡"))
     ad         = f"{asi:,.2f}" if asi > 0 else "201,156.86"
     data_label = latest_date if market["is_open"] else f"Closed · Last: {latest_date}"
-    brief_ok   = bool(_home_get_ai_brief())
+    _brief_res = _load_home_briefs()
+    brief_ok   = bool(_brief_res)
     brief_color= "#F0A500" if brief_ok else "#808080"
     top_g      = sorted(uniq, key=lambda x:float(x.get("change_percent",0) or 0), reverse=True)[:5]
     top_g_text = ", ".join(f"{p['symbol']} (+{float(p.get('change_percent',0)):.1f}%)" for p in top_g[:3])
     notif_minutes = (now.hour * 60 + now.minute) % 137 + 3
 
+    # ── GLOBAL PULSE — fetch once, used in both funnels and AI context ─────
+    _gp = None
+    try:
+        _gp = get_global_pulse()
+    except Exception:
+        pass  # never block render
+    _gp_ai_ctx = get_global_pulse_for_ai(_gp) if _gp else ""
+
     # AI prompt args bundle
     _pai = dict(ad=ad, aarr=aarr, acg=acg, mood=mood, gc=gc, lc=lc, total=total,
                 top_g_text=top_g_text, latest_date=latest_date,
-                market_open=market["is_open"], uniq=uniq)
+                market_open=market["is_open"], uniq=uniq,
+                global_context=_gp_ai_ctx)
 
     # Pre-generate today's signal insights
     insight_key = f"ins_{_daily_seed()}"
     if insight_key not in st.session_state.get("mai_insights", {}):
         if "mai_insights" not in st.session_state: st.session_state.mai_insights = {}
-        sig_res_data = _home_get_signal_scores_top(50)
+        sig_res_data = _load_home_signals()
         generated = []; seen_ins = set()
-        for s in sig_res_data:
+        for s in (sig_res_data):
             sym = s.get("symbol",""); sig = (s.get("signal") or "HOLD").upper().replace(" ","_")
             if sym in seen_ins or not sym: continue
             seen_ins.add(sym)
@@ -2439,8 +2429,10 @@ def render():
         for ins in insights: track_stock_analyzed(ins["sym"])
         st.session_state.insights_tracked = True
 
+    # Fetch signal scores for trending
+    _sig_res_data = _load_home_trending_signals()
     _sig_map: dict = {}
-    for _sr in _home_get_signal_scores_full(200):
+    for _sr in (_sig_res_data):
         _s = _sr.get("symbol","")
         if _s and _s not in _sig_map: _sig_map[_s] = _sr
 
@@ -2500,6 +2492,10 @@ def render():
 
         # ── HOOK: Live notification banner ───────────────────────────────────
         _render_notification_banner(top_g, now, gc, total, market, notif_minutes)
+
+        # ── GLOBAL PULSE — visible all tiers, Naira impact gated to paid ─────
+        if _gp:
+            render_global_pulse_strip(tier, location="home")
 
         # ── HOOK: Market status ───────────────────────────────────────────────
         st.markdown(f'<div style="background:#0A0A0A;border:1px solid {market["color"]}44;border-left:3px solid {market["color"]};border-radius:8px;padding:9px 14px;margin-bottom:14px;display:flex;align-items:center;gap:10px;font-family:DM Mono,monospace;"><span>{"📈" if market["is_open"] else "🔒"}</span><div><span style="font-size:12px;font-weight:600;color:{market["color"]};">{market["label"]}</span><span style="font-size:11px;color:#606060;margin-left:8px;">{market["note"]}</span></div></div>', unsafe_allow_html=True)
@@ -2567,8 +2563,8 @@ def render():
         # ── HOOK: AI Brief teaser ─────────────────────────────────────────────
         with st.expander("✨  TODAY'S MARKET AI BRIEF — FULL REPORT", expanded=False):
             if brief_ok:
-                raw2     = brief_res.data[0].get("body","")
-                bdate    = brief_res.data[0].get("brief_date",today)
+                raw2     = _brief_res[0].get("body","")
+                bdate    = _brief_res[0].get("brief_date",today)
                 clean    = re.sub(r'\*\*(.+?)\*\*', r'\1', raw2)
                 sections = [s for s in clean.strip().split("\n\n") if s.strip()]
                 st.caption(f"📅 AI Market Brief — {bdate}")
@@ -2786,9 +2782,9 @@ def render():
         # ── CONTEXT: Market Snapshot (paid users — fast plain-English context) ─
         if can_access("market_snapshot", tier):
             _sector_insight = ""
-            _sec_data2 = _home_get_sectors()
-            if _sec_data2:
-                _top_sec = _sec_data2[0]
+            _sec2_data = _load_home_sectors()
+            if _sec2_data:
+                _top_sec = _sec2_data[0]
                 _sec_chg = float(_top_sec.get("change_percent",0) or 0)
                 _sec_nm  = _top_sec.get("sector_name","")
                 if _sec_nm:
@@ -2813,6 +2809,10 @@ def render():
   </div>
 </div>""", unsafe_allow_html=True)
 
+        # ── GLOBAL PULSE — below Market Snapshot, visible all tiers ────────────
+        if _gp:
+            render_global_pulse_strip(tier, location="home")
+
         # ── INTELLIGENCE: AI Chat (full) ──────────────────────────────────────
         st.markdown('<div class="sec-title">✨ Market AI — Ask Anything</div>', unsafe_allow_html=True)
 
@@ -2823,8 +2823,8 @@ def render():
             elif not is_visitor:
                 st.caption(f"🇳🇬 Pidgin mode available on Trader plan (your plan: {tier.upper()})")
             if brief_ok:
-                raw2     = brief_res.data[0].get("body","")
-                bdate    = brief_res.data[0].get("brief_date",today)
+                raw2     = _brief_res[0].get("body","")
+                bdate    = _brief_res[0].get("brief_date",today)
                 clean    = re.sub(r'\*\*(.+?)\*\*', r'\1', raw2)
                 sections = [s for s in clean.strip().split("\n\n") if s.strip()]
                 st.caption(f"📅 AI Market Brief — {bdate}")
