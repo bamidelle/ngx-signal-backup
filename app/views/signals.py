@@ -832,7 +832,21 @@ def render():
     </div>
     """, unsafe_allow_html=True)
 
-    # ── GLOBAL PULSE — slim context bar (all tiers) ────────────────────────
+    # ── GLOBAL PULSE — fetch once, render slim bar, cache vars for cards ────
+    _gp = None
+    _gp_oil_chg = 0.0
+    _gp_dxy_chg = 0.0
+    _gp_btc_chg = 0.0
+    _gp_fg_score = 50.0
+    try:
+        _gp = get_global_pulse()
+        if _gp:
+            _gp_oil_chg  = _gp["data"].get("oil", {}).get("change_pct", 0.0)
+            _gp_dxy_chg  = _gp["data"].get("dxy", {}).get("change_pct", 0.0)
+            _gp_btc_chg  = _gp["data"].get("btc", {}).get("change_pct", 0.0)
+            _gp_fg_score = _gp["data"].get("fg", {}).get("score", 50.0)
+    except Exception:
+        pass  # never crash the signals page
     if _gp:
         render_global_pulse_strip(tier, location="signals")
 
@@ -858,22 +872,6 @@ def render():
             placeholder="e.g. GTCO",
             key="sig_search"
         ).upper().strip()
-
-    # ── GLOBAL PULSE — fetch once for slim bar + per-card context ──────────
-    _gp = None
-    _gp_oil_chg = 0.0
-    _gp_dxy_chg = 0.0
-    _gp_btc_chg = 0.0
-    _gp_fg_score = 50.0
-    try:
-        _gp = get_global_pulse()
-        if _gp:
-            _gp_oil_chg  = _gp["data"].get("oil", {}).get("change_pct", 0.0)
-            _gp_dxy_chg  = _gp["data"].get("dxy", {}).get("change_pct", 0.0)
-            _gp_btc_chg  = _gp["data"].get("btc", {}).get("change_pct", 0.0)
-            _gp_fg_score = _gp["data"].get("fg", {}).get("score", 50.0)
-    except Exception:
-        pass  # never crash the signals page
 
     # ── APPLY FILTERS (data already loaded via cache above) ──────────────────
     label_to_code = {
