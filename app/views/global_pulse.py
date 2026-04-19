@@ -1,1158 +1,162 @@
-"""
-NGX Signal — Global Pulse  v1.0
-================================
-Watches 4 global signals every morning and translates them into plain-English
-Nigerian-context intelligence.
-
-Signals tracked:
-  1. Brent Crude Oil price + % change   (Yahoo Finance — free, no key)
-  2. USD/NGN exchange rate              (Yahoo Finance — free, no key)
-  3. Bitcoin price + % change           (CoinGecko — free, no key)
-  4. Global Fear/Greed mood score       (CNN Fear & Greed — free)
-
-AI Summary chain:
-  Layer 1 — Gemini 1.5 Flash (primary)
-  Layer 2 — Groq / Llama-3.3-70b (fallback)
-  Layer 3 — News RSS headlines for context (Reuters, FT — free)
-  Layer 4 — Strong deterministic rules (always works, zero cost)
-
-Tier access:
-  • Four tiles + direction arrows      → ALL tiers (visitor, free, trial, paid)
-  • Naira impact labels + summary      → Paid only (trial, starter, trader, pro)
-  • Silent AI injection into Ask AI    → All tiers that can use Ask AI
-
-Caching:
-  Market data  → 30-minute TTL  (external APIs, rate-limit safe)
-  AI summary   → daily seed key (one AI call per day per user session)
-  News context → 60-minute TTL
-"""
-
-import streamlit as st
-import requests
-import json
-from datetime import datetime, date, timedelta, timezone
-
-# ── Timezone helpers (mirrors home.py pattern) ────────────────────────────────
-try:
-    import pytz
-    _WAT = pytz.timezone("Africa/Lagos")
-    def _now_wat(): return datetime.now(_WAT)
-except ImportError:
-    _WAT_TZ = timezone(timedelta(hours=1))
-    def _now_wat(): return datetime.now(_WAT_TZ)
-
-# ── Tier config ───────────────────────────────────────────────────────────────
-_PAID_TIERS = {"trial", "starter", "trader", "pro"}
-
-# ══════════════════════════════════════════════════════════════════════════════
-# LAYER 1 — MARKET DATA FETCHERS  (all free APIs, no keys needed)
-# ══════════════════════════════════════════════════════════════════════════════
-
-@st.cache_data(ttl=1800)   # 30 minutes — safe for all free-tier rate limits
-def _fetch_yahoo_quote(symbol: str) -> dict:
-    """
-    Fetch a single quote from Yahoo Finance unofficial JSON endpoint.
-    Returns dict with keys: price, change_pct, name  — or empty dict on failure.
-    """
-    try:
-        url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
-        r = requests.get(
-            url,
-            params={"interval": "1d", "range": "2d"},
-            headers={"User-Agent": "Mozilla/5.0"},
-            timeout=10,
-        )
-        if r.status_code != 200:
-            return {}
-        data = r.json()
-        meta = data.get("chart", {}).get("result", [{}])[0].get("meta", {})
-        price      = float(meta.get("regularMarketPrice", 0) or 0)
-        prev_close = float(meta.get("chartPreviousClose", 0) or
-                          meta.get("previousClose", 0) or price)
-        change_pct = ((price - prev_close) / prev_close * 100) if prev_close else 0.0
-        return {"price": price, "change_pct": round(change_pct, 2),
-                "name": meta.get("shortName", symbol)}
-    except Exception:
-        return {}
-
-
-@st.cache_data(ttl=1800)
-def _fetch_bitcoin() -> dict:
-    """CoinGecko free API — no key, very stable."""
-    try:
-        r = requests.get(
-            "https://api.coingecko.com/api/v3/simple/price",
-            params={"ids": "bitcoin", "vs_currencies": "usd",
-                    "include_24hr_change": "true"},
-            timeout=10,
-        )
-        if r.status_code != 200:
-            return {}
-        d = r.json().get("bitcoin", {})
-        return {
-            "price":      float(d.get("usd", 0)),
-            "change_pct": round(float(d.get("usd_24h_change", 0)), 2),
-        }
-    except Exception:
-        return {}
-
-
-@st.cache_data(ttl=1800)
-def _fetch_fear_greed() -> dict:
-    """
-    CNN Fear & Greed Index — unofficial but widely reliable endpoint.
-    Returns score 0-100 and label.
-    """
-    try:
-        r = requests.get(
-            "https://production.dataviz.cnn.io/index/fearandgreed/graphdata",
-            headers={"User-Agent": "Mozilla/5.0",
-                     "Referer": "https://www.cnn.com/markets/fear-and-greed"},
-            timeout=10,
-        )
-        if r.status_code != 200:
-            return {}
-        d = r.json()
-        score = float(d.get("fear_and_greed", {}).get("score", 50))
-        label = d.get("fear_and_greed", {}).get("rating", "Neutral")
-        return {"score": round(score), "label": label}
-    except Exception:
-        return {}
-
-
-@st.cache_data(ttl=1800)
-def fetch_global_pulse_data() -> dict:
-    """
-    Master data fetch — all four signals in one cached call.
-    Returns a dict with keys: oil, dxy, btc, fg  (fear/greed)
-    Each sub-dict always has at least {"ok": bool}.
-    """
-    oil = _fetch_yahoo_quote("BZ=F")     # Brent Crude Futures
-    dxy = _fetch_yahoo_quote("USDNGN=X") # USD to Naira live rate
-    btc = _fetch_bitcoin()
-    fg  = _fetch_fear_greed()
-
-    return {
-        "oil": {**oil, "ok": bool(oil.get("price"))},
-        "dxy": {**dxy, "ok": bool(dxy.get("price"))},
-        "btc": {**btc, "ok": bool(btc.get("price"))},
-        "fg":  {**fg,  "ok": bool(fg.get("score") is not None)},
-        "fetched_at": _now_wat().strftime("%I:%M %p WAT"),
-    }
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# LAYER 2 — NEWS CONTEXT FETCHER  (Reuters / FT RSS — free)
-# ══════════════════════════════════════════════════════════════════════════════
-
-@st.cache_data(ttl=3600)   # 60 minutes
-def _fetch_global_news_headlines(max_items: int = 6) -> list[str]:
-    """
-    Fetch top financial headlines from Reuters RSS for AI context.
-    Returns list of headline strings — empty list on failure.
-    """
-    import xml.etree.ElementTree as ET
-    feeds = [
-        "https://feeds.reuters.com/reuters/businessNews",
-        "https://feeds.reuters.com/reuters/UKBusinessNews",
-    ]
-    headlines = []
-    for url in feeds:
-        if len(headlines) >= max_items:
-            break
-        try:
-            r = requests.get(
-                url,
-                headers={"User-Agent": "Mozilla/5.0"},
-                timeout=8,
-            )
-            if r.status_code != 200:
-                continue
-            root = ET.fromstring(r.text)
-            for item in root.findall(".//item"):
-                title = (item.findtext("title") or "").strip()
-                if title and len(title) > 20:
-                    headlines.append(title)
-                if len(headlines) >= max_items:
-                    break
-        except Exception:
-            continue
-    return headlines
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# LAYER 3 — DETERMINISTIC NAIRA IMPACT RULES  (always works, zero API cost)
-# ══════════════════════════════════════════════════════════════════════════════
-
-def _rule_based_naira_impact(data: dict) -> dict:
-    """
-    Pure logic — derives Nigerian market context from the raw numbers.
-    Returns a dict with keys matching all four tiles + a summary sentence.
-    Always produces output regardless of AI availability.
-    """
-    oil  = data.get("oil", {})
-    dxy  = data.get("dxy", {})
-    btc  = data.get("btc", {})
-    fg   = data.get("fg", {})
-
-    oil_chg = oil.get("change_pct", 0)
-    dxy_chg = dxy.get("change_pct", 0)
-    btc_chg = btc.get("change_pct", 0)
-    fg_score = fg.get("score", 50)
-
-    # ── Oil impact ────────────────────────────────────────────────────────────
-    if oil_chg >= 2.0:
-        oil_impact = "Strong positive for Nigeria. Higher oil revenue eases Naira pressure. Energy stocks like Seplat and Oando may rally."
-        oil_mood   = "positive"
-    elif oil_chg >= 0.5:
-        oil_impact = "Mild positive for Nigeria. Slightly higher oil revenue — watch energy stocks for upside."
-        oil_mood   = "positive"
-    elif oil_chg <= -2.0:
-        oil_impact = "Negative signal for Nigeria. Lower oil prices reduce government revenue and increase Naira pressure."
-        oil_mood   = "negative"
-    elif oil_chg <= -0.5:
-        oil_impact = "Mild negative. Slightly lower oil revenue — energy stocks may face headwinds today."
-        oil_mood   = "negative"
-    else:
-        oil_impact = "Oil is steady — no immediate Naira pressure from crude prices today."
-        oil_mood   = "neutral"
-
-    # ── USD/NGN rate impact ───────────────────────────────────────────────────
-    dxy_price = dxy.get("price", 0)  # actual Naira per Dollar today
-    if dxy_chg >= 1.0:
-        dxy_impact = f"Naira weakening — dollar now costs N{dxy_price:,.0f}. Imported goods are getting more expensive. Companies like Nestle and Unilever face higher costs."
-        dxy_mood   = "negative"
-    elif dxy_chg >= 0.3:
-        dxy_impact = f"Dollar edging up to N{dxy_price:,.0f}. Mild Naira pressure — watch importers and companies with dollar-denominated debt."
-        dxy_mood   = "negative"
-    elif dxy_chg <= -1.0:
-        dxy_impact = f"Naira strengthening — dollar rate dropped to N{dxy_price:,.0f}. Import costs easing. Positive for consumer goods companies and foreign investor flows."
-        dxy_mood   = "positive"
-    elif dxy_chg <= -0.3:
-        dxy_impact = f"Dollar slightly cheaper at N{dxy_price:,.0f}. Small Naira gain — mild positive for NGX and imported-goods companies."
-        dxy_mood   = "positive"
-    else:
-        dxy_impact = f"Dollar/Naira steady at N{dxy_price:,.0f}. No significant currency pressure on NGX today."
-        dxy_mood   = "neutral"
-
-    # ── Bitcoin impact ────────────────────────────────────────────────────────
-    if btc_chg >= 5.0:
-        btc_impact = "Bitcoin surging — global investors are in full risk-on mode. This positive sentiment often flows into stock markets including NGX."
-        btc_mood   = "positive"
-    elif btc_chg >= 2.0:
-        btc_impact = "Bitcoin rising — risk appetite is growing globally. Good sign for equity markets and growth stocks."
-        btc_mood   = "positive"
-    elif btc_chg <= -5.0:
-        btc_impact = "Bitcoin dropping sharply — risk-off mood globally. Investors may be cautious. Watch NGX for reduced buying activity."
-        btc_mood   = "negative"
-    elif btc_chg <= -2.0:
-        btc_impact = "Bitcoin falling — some risk-off sentiment building. Could dampen enthusiasm for growth stocks today."
-        btc_mood   = "negative"
-    else:
-        btc_impact = "Bitcoin is quiet — no strong global risk signal from crypto markets today."
-        btc_mood   = "neutral"
-
-    # ── Fear & Greed impact ───────────────────────────────────────────────────
-    if fg_score >= 75:
-        fg_label   = "Extreme Greed"
-        fg_impact  = "Extreme greed globally — big investors are very confident and buying aggressively. Strong environment for NGX growth stocks."
-        fg_mood    = "positive"
-    elif fg_score >= 55:
-        fg_label   = "Greed"
-        fg_impact  = "Greed mode globally — investors are confident. Positive conditions for NGX stocks today."
-        fg_mood    = "positive"
-    elif fg_score >= 45:
-        fg_label   = "Neutral"
-        fg_impact  = "Global mood is balanced — neither fearful nor greedy. Normal trading conditions for NGX."
-        fg_mood    = "neutral"
-    elif fg_score >= 25:
-        fg_label   = "Fear"
-        fg_impact  = "Fear in global markets — investors are cautious. This can lead to reduced risk appetite on NGX too."
-        fg_mood    = "negative"
-    else:
-        fg_label   = "Extreme Fear"
-        fg_impact  = "Extreme fear globally — investors are pulling back. Be extra cautious with new positions on NGX today."
-        fg_mood    = "negative"
-
-    # Use raw label if available
-    if fg.get("label"):
-        fg_label = fg["label"].title()
-
-    # ── Master summary sentence ───────────────────────────────────────────────
-    positives = sum(1 for m in [oil_mood, dxy_mood, btc_mood, fg_mood] if m == "positive")
-    negatives = sum(1 for m in [oil_mood, dxy_mood, btc_mood, fg_mood] if m == "negative")
-
-    if positives >= 3:
-        summary = (
-            f"Oil {'up' if oil_chg > 0 else 'stable'} and global confidence is high — "
-            f"NGX may open positively today. Good conditions to watch your growth stocks."
-        )
-    elif negatives >= 3:
-        summary = (
-            f"Multiple global headwinds today — {'oil falling, ' if oil_chg < -0.5 else ''}"
-            f"{'dollar strengthening, ' if dxy_chg > 0.3 else ''}"
-            f"risk appetite is low. Exercise extra caution with new positions on NGX."
-        )
-    elif oil_mood == "positive" and dxy_mood == "negative":
-        summary = (
-            "Oil rising and dollar weakening — the best combination for Nigeria. "
-            "Naira pressure easing and export revenue growing. Strong environment for NGX today."
-        )
-    elif oil_mood == "negative" and dxy_mood == "positive":
-        summary = (
-            "Oil falling with a stronger dollar — double headwind for the Naira. "
-            "Focus on defensive stocks and avoid over-extending positions today."
-        )
-    elif positives >= 2:
-        summary = (
-            "Global conditions are mostly positive today. "
-            "Cautious optimism is reasonable — check individual signal scores before acting."
-        )
-    elif negatives >= 2:
-        summary = (
-            "Mixed global signals with a cautious lean. "
-            "Stick to strong BUY signals today and avoid speculative positions."
-        )
-    else:
-        summary = (
-            "Global markets are quiet today — no strong tailwinds or headwinds for NGX. "
-            "Follow individual stock signals rather than broad market trends."
-        )
-
-    return {
-        "oil_impact":  oil_impact,
-        "oil_mood":    oil_mood,
-        "dxy_impact":  dxy_impact,
-        "dxy_mood":    dxy_mood,
-        "btc_impact":  btc_impact,
-        "btc_mood":    btc_mood,
-        "fg_impact":   fg_impact,
-        "fg_mood":     fg_mood,
-        "fg_label":    fg_label,
-        "summary":     summary,
-        "source":      "rules",
-    }
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# LAYER 4 — AI SUMMARY GENERATOR  (Gemini → Groq → rules fallback)
-# ══════════════════════════════════════════════════════════════════════════════
-
-def _build_global_pulse_prompt(data: dict, headlines: list[str]) -> str:
-    """Build the AI prompt for global pulse Naira-context analysis."""
-    oil  = data.get("oil", {})
-    dxy  = data.get("dxy", {})
-    btc  = data.get("btc", {})
-    fg   = data.get("fg", {})
-
-    news_text = "\n".join(f"- {h}" for h in headlines[:6]) if headlines else "No headlines available."
-
-    return f"""You are NGX Signal AI — a Nigerian stock market intelligence assistant.
-
-Today's global market data:
-- Brent Crude Oil: ${oil.get('price', 'N/A'):.2f} | Change: {oil.get('change_pct', 0):+.2f}%
-- USD/NGN Exchange Rate: N{dxy.get('price', 0):,.0f} per dollar | Change: {dxy.get('change_pct', 0):+.2f}%
-- Bitcoin: ${btc.get('price', 0):,.0f} | Change: {btc.get('change_pct', 0):+.2f}%
-- Global Fear & Greed Score: {fg.get('score', 50)}/100 — {fg.get('label', 'Neutral')}
-
-Recent global financial headlines:
-{news_text}
-
-YOUR TASK — Write a Global Pulse analysis for Nigerian investors. Respond ONLY with a valid JSON object, no markdown, no extra text:
-
-{{
-  "oil_impact": "One sentence: what does today's oil move mean for Nigeria, the Naira, and specific NGX sectors (mention Seplat/Oando if relevant). Max 25 words.",
-  "dxy_impact": "One sentence: what does today's USD/NGN rate (NX per dollar) mean for Nigerian investors, importers and the Naira. Include the actual rate. Max 28 words.",
-  "btc_impact": "One sentence: what does Bitcoin's move signal about global investor mood and what that means for NGX. Max 25 words.",
-  "fg_impact": "One sentence: what does today's Fear & Greed score mean for Nigerian investors and NGX trading conditions. Max 25 words.",
-  "summary": "One powerful summary sentence (max 35 words) that tells a Nigerian investor exactly what the global picture means for their NGX portfolio today. Make it actionable and specific."
-}}
-
-RULES:
-- Never use jargon (no 'bullish', 'bearish', 'RSI', 'support levels')
-- Always tie back to Nigeria, the Naira, or specific NGX stocks/sectors
-- Sound like a smart Nigerian financial friend, not a robot
-- Each sentence must be genuinely different — no repetition
-- The summary must be the most useful single sentence a Nigerian investor could read this morning
-"""
-
-
-def _call_gemini(prompt: str, max_tokens: int = 400) -> str | None:
-    """Call Gemini 1.5 Flash — primary AI layer."""
-    key = st.secrets.get("GEMINI_API_KEY", "")
-    if not key:
-        return None
-    try:
-        r = requests.post(
-            f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={key}",
-            json={
-                "contents": [{"parts": [{"text": prompt}]}],
-                "generationConfig": {"maxOutputTokens": max_tokens, "temperature": 0.3},
-            },
-            timeout=20,
-        )
-        if r.status_code != 200:
-            return None
-        parts = r.json().get("candidates", [{}])[0].get("content", {}).get("parts", [{}])
-        return parts[0].get("text", "").strip() if parts else None
-    except Exception:
-        return None
-
-
-def _call_groq(prompt: str, max_tokens: int = 400) -> str | None:
-    """Call Groq Llama — fallback AI layer."""
-    key = st.secrets.get("GROQ_API_KEY", "")
-    if not key:
-        return None
-    for model in ["llama-3.3-70b-versatile", "llama-3.1-8b-instant"]:
-        try:
-            r = requests.post(
-                "https://api.groq.com/openai/v1/chat/completions",
-                headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
-                json={
-                    "model": model,
-                    "messages": [{"role": "user", "content": prompt}],
-                    "max_tokens": max_tokens,
-                    "temperature": 0.3,
-                },
-                timeout=20,
-            )
-            if r.status_code == 200:
-                return r.json()["choices"][0]["message"]["content"].strip()
-        except Exception:
-            continue
-    return None
-
-
-def _parse_ai_json(raw: str) -> dict | None:
-    """Safely extract and parse JSON from AI response."""
-    if not raw:
-        return None
-    try:
-        # Strip markdown fences if present
-        clean = raw.replace("```json", "").replace("```", "").strip()
-        # Find the JSON object
-        start = clean.find("{")
-        end   = clean.rfind("}") + 1
-        if start == -1 or end == 0:
-            return None
-        parsed = json.loads(clean[start:end])
-        required = {"oil_impact", "dxy_impact", "btc_impact", "fg_impact", "summary"}
-        if required.issubset(parsed.keys()):
-            return parsed
-    except Exception:
-        pass
-    return None
-
-
-def _generate_ai_impacts(data: dict) -> dict | None:
-    """
-    Try Gemini → Groq in sequence.
-    Returns parsed impact dict or None if both fail.
-    """
-    headlines = _fetch_global_news_headlines()
-    prompt    = _build_global_pulse_prompt(data, headlines)
-
-    # Layer 1: Gemini
-    raw = _call_gemini(prompt)
-    parsed = _parse_ai_json(raw)
-    if parsed:
-        parsed["source"] = "gemini"
-        return parsed
-
-    # Layer 2: Groq
-    raw = _call_groq(prompt)
-    parsed = _parse_ai_json(raw)
-    if parsed:
-        parsed["source"] = "groq"
-        return parsed
-
-    return None
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# MASTER FUNCTION — get_global_pulse()
-# ══════════════════════════════════════════════════════════════════════════════
-
-def get_global_pulse() -> dict:
-    """
-    Public entry point. Returns the full Global Pulse dict.
-
-    Always returns a result — never raises or crashes.
-    AI impacts are cached in session_state with a daily seed key so the
-    AI is only called once per day per user session, not on every rerender.
-
-    Keys in returned dict:
-      data         → raw market data (oil, dxy, btc, fg)
-      impacts      → impact text for each signal (source: gemini/groq/rules)
-      tier_ok      → bool — True if caller is on a paid plan (set externally)
-      fetched_at   → time string
-    """
-    # Step 1: Get raw market data (cached 30 min)
-    data = fetch_global_pulse_data()
-
-    # Step 2: Check session cache for today's AI impacts
-    _daily_key = f"_gp_impacts_{date.today().isoformat()}"
-    impacts = st.session_state.get(_daily_key)
-
-    if not impacts:
-        # Step 3a: Try AI (Gemini → Groq)
-        ai_result = None
-        try:
-            ai_result = _generate_ai_impacts(data)
-        except Exception:
-            pass
-
-        if ai_result:
-            # Merge moods from rule-based (AI doesn't return moods, we need them for tile colors)
-            rule_result = _rule_based_naira_impact(data)
-            impacts = {**rule_result, **ai_result}
-            impacts["source"] = ai_result.get("source", "ai")
-        else:
-            # Step 3b: Pure deterministic rules fallback
-            impacts = _rule_based_naira_impact(data)
-
-        # Cache in session state for the day
-        st.session_state[_daily_key] = impacts
-
-    return {
-        "data":       data,
-        "impacts":    impacts,
-        "fetched_at": data.get("fetched_at", ""),
-    }
-
-
-def get_global_pulse_for_ai(pulse: dict | None = None) -> str:
-    """
-    Returns a compact global context string for injection into AI prompts.
-    Silent — never shows anything to the user.
-    Fetches pulse data if not already provided.
-    """
-    try:
-        if pulse is None:
-            pulse = get_global_pulse()
-        data    = pulse.get("data", {})
-        impacts = pulse.get("impacts", {})
-        oil     = data.get("oil", {})
-        dxy     = data.get("dxy", {})
-        btc     = data.get("btc", {})
-        fg      = data.get("fg", {})
-        return (
-            f"\nGLOBAL MARKET CONTEXT (today):\n"
-            f"- Brent Crude Oil: ${oil.get('price', 0):.2f} ({oil.get('change_pct', 0):+.2f}%)\n"
-            f"- USD/NGN Rate: N{dxy.get('price', 0):,.0f} per dollar ({dxy.get('change_pct', 0):+.2f}%)\n"
-            f"- Bitcoin: ${btc.get('price', 0):,.0f} ({btc.get('change_pct', 0):+.2f}%)\n"
-            f"- Global mood: {fg.get('label', 'Neutral')} ({fg.get('score', 50)}/100)\n"
-            f"- Nigerian context: {impacts.get('summary', '')}\n"
-        )
-    except Exception:
-        return ""
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# RENDERER — render_global_pulse_strip()
-# ══════════════════════════════════════════════════════════════════════════════
-
 def render_global_pulse_strip(tier: str, location: str = "home") -> None:
     """
-    Renders the Global Pulse component inline.
-
-    Args:
-        tier:     User's current plan tier string
-        location: "home" | "signals" — controls layout variant
-                  "home"    → full four-tile grid + summary sentence
-                  "signals" → compact single-line context bar
-
-    Tier access:
-        All tiers  → tiles with direction arrows + basic label
-        Paid only  → Naira impact text + summary sentence
+    Upgraded Fintech Dashboard Renderer.
+    Focuses on dominant numerical display with fixed-height card architecture.
     """
     is_paid = tier in _PAID_TIERS
 
-    # Silently fetch — never block render
     try:
-        pulse   = get_global_pulse()
-        data    = pulse["data"]
+        pulse = get_global_pulse()
+        data = pulse["data"]
         impacts = pulse["impacts"]
     except Exception:
-        return   # fail silently — never crash the page
+        return
 
-    oil  = data.get("oil", {})
-    dxy  = data.get("dxy", {})
-    btc  = data.get("btc", {})
-    fg   = data.get("fg", {})
+    # Helper for Arrows and Colors
+    def _get_trend(v):
+        if v > 0: return "▲", "#22C55E", "up"
+        if v < 0: return "▼", "#EF4444", "down"
+        return "–", "#6B7280", "neutral"
 
-    oil_chg  = oil.get("change_pct", 0)
-    dxy_chg  = dxy.get("change_pct", 0)
-    btc_chg  = btc.get("change_pct", 0)
-    fg_score = fg.get("score", 50)
-    fg_label = impacts.get("fg_label", fg.get("label", "Neutral"))
+    # CSS Injection for the Premium Dashboard Look
+    st.markdown("""
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@500;700&display=swap');
+        
+        .gp-container {
+            margin-bottom: 20px;
+        }
 
-    def _arrow(v):
-        return "▲" if v > 0 else "▼" if v < 0 else "–"
+        .ngx-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+            gap: 10px;
+            margin-top: 10px;
+        }
 
-    def _chg_color(v):
-        return "#22C55E" if v > 0 else "#EF4444" if v < 0 else "#6B7280"
+        .ngx-card {
+            background: #0A0C0F;
+            border: 1px solid #1E2229;
+            border-radius: 8px;
+            padding: 10px 12px;
+            height: 115px; /* Strict Fixed Height */
+            display: flex;
+            flex-direction: column;
+            justify-content: space-between;
+            overflow: hidden;
+            transition: border-color 0.3s ease;
+        }
 
-    def _mood_color(mood):
-        return {"positive": "#22C55E", "negative": "#EF4444", "neutral": "#6B7280"}.get(mood, "#6B7280")
+        .ngx-label {
+            font-family: 'Inter', sans-serif;
+            font-size: 10px;
+            font-weight: 600;
+            color: #4B5563;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            white-space: nowrap;
+        }
 
-    # ── SIGNALS PAGE: compact one-line bar ────────────────────────────────────
+        .ngx-price-xl {
+            font-family: 'DM Mono', monospace;
+            font-size: 42px; /* Dominant Number */
+            font-weight: 600;
+            color: #FFFFFF;
+            line-height: 1;
+            letter-spacing: -0.05em;
+            margin: 4px 0;
+            transform: scale(1.04);
+            transform-origin: left center;
+        }
+
+        .ngx-pct {
+            font-family: 'DM Mono', monospace;
+            font-size: 13px;
+            font-weight: 600;
+        }
+
+        .ngx-impact-mini {
+            font-size: 10px;
+            color: #9CA3AF;
+            line-height: 1.2;
+            margin-top: 5px;
+            display: -webkit-box;
+            -webkit-line-clamp: 2;
+            -webkit-box-orient: vertical;
+            overflow: hidden;
+        }
+
+        /* Mobile specific adjustments to prevent overflow */
+        @media (max-width: 640px) {
+            .ngx-price-xl { font-size: 34px; }
+            .ngx-grid { grid-template-columns: 1fr 1fr; }
+        }
+    </style>
+    """, unsafe_allow_html=True)
+
+    # Signal Bar logic for "signals" location remains compact
     if location == "signals":
-        parts = []
-        if oil.get("ok"):
-            parts.append(
-                f'<span style="color:{_chg_color(oil_chg)};">'
-                f'🛢️ Oil {_arrow(oil_chg)}{abs(oil_chg):.1f}%</span>'
-            )
-        if dxy.get("ok"):
-            parts.append(
-                f'<span style="color:{_chg_color(dxy_chg)};">'
-                f'💵 Dollar {_arrow(dxy_chg)}{abs(dxy_chg):.1f}%</span>'
-            )
-        if btc.get("ok"):
-            parts.append(
-                f'<span style="color:{_chg_color(btc_chg)};">'
-                f'₿ BTC {_arrow(btc_chg)}{abs(btc_chg):.1f}%</span>'
-            )
-        if fg.get("ok"):
-            fg_col = _chg_color(fg_score - 50)
-            parts.append(
-                f'<span style="color:{fg_col};">🌍 {fg_label}</span>'
-            )
+        # ... (You can keep your existing compact bar logic or apply the styles above)
+        pass
 
-        pills = '&nbsp;&nbsp;·&nbsp;&nbsp;'.join(parts)
-
-        if is_paid:
-            summary_html = (
-                f'<div style="font-size:11px;color:#C8C4BC;margin-top:5px;padding-top:5px;'
-                f'border-top:1px solid #1E2229;">'
-                f'<span style="color:#F0A500;font-weight:600;">NGX context:</span> '
-                f'{impacts.get("summary", "")}'
-                f'</div>'
-            )
-        else:
-            summary_html = (
-                '<div style="font-size:10px;color:#4B5563;margin-top:4px;">'
-                '🔒 <a href="#" style="color:#F0A500;">Upgrade</a> to see what this means for your NGX portfolio'
-                '</div>'
-            )
-
-        st.markdown(f"""
-<div style="background:#080A0D;border:1px solid #1E2229;border-radius:8px;
-            padding:9px 14px;margin-bottom:14px;font-family:'DM Mono',monospace;">
-  <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
-    <span style="font-size:9px;color:#4B5563;text-transform:uppercase;
-                 letter-spacing:.09em;font-weight:600;flex-shrink:0;">🌍 Global Pulse</span>
-    <span style="font-size:11px;">{pills}</span>
-  </div>
-  {summary_html}
-</div>
-""", unsafe_allow_html=True)
-        return
-
-    # ── HOMEPAGE: full four-tile grid + summary ───────────────────────────────
-
-    # ── Compact number formatter ───────────────────────────────────────────────
-    def _compact(val: float, prefix: str = "") -> str:
-        """Convert large numbers to compact fintech format: 1540 → 1.54K etc."""
-        abs_val = abs(val)
-        if abs_val >= 1_000_000_000:
-            return f"{prefix}{val/1_000_000_000:.2f}B"
-        if abs_val >= 1_000_000:
-            return f"{prefix}{val/1_000_000:.2f}M"
-        if abs_val >= 10_000:
-            return f"{prefix}{val/1_000:.1f}K"
-        if abs_val >= 1_000:
-            return f"{prefix}{val/1_000:.2f}K"
-        return f"{prefix}{val:.2f}"
-
-    # ── Build tile data ────────────────────────────────────────────────────────
+    # Build Tile List
     tiles = []
+    keys = [
+        ("oil", "🛢️ Oil", "price", "${:,.2f}"),
+        ("dxy", "💵 USD/NGN", "price", "N{:,.0f}"),
+        ("btc", "₿ Bitcoin", "price", "${:,.0f}"),
+        ("fg", "🌍 Mood", "score", "{:,.0f}/100")
+    ]
 
-    if oil.get("ok"):
-        tiles.append({
-            "label":   "BRENT CRUDE",
-            "value":   f"${oil['price']:.2f}",
-            "sub":     "",
-            "change":  f"{_arrow(oil_chg)} {abs(oil_chg):.2f}%",
-            "color":   _chg_color(oil_chg),
-            "impact":  impacts.get("oil_impact", ""),
-            "border":  _chg_color(oil_chg),
-        })
+    for key, label, val_key, fmt in keys:
+        d = data.get(key, {})
+        if d.get("ok"):
+            val = d.get(val_key, 0)
+            chg = d.get("change_pct", 0) if key != "fg" else (val - 50)
+            arr, col, cls = _get_trend(chg)
+            
+            # Special case for F&G label
+            display_val = fmt.format(val)
+            if key == "fg": display_val = impacts.get("fg_label", "Neutral")
 
-    if dxy.get("ok"):
-        tiles.append({
-            "label":   "USD / NGN",
-            "value":   _compact(dxy['price'], "N"),
-            "sub":     "",
-            "change":  f"{_arrow(dxy_chg)} {abs(dxy_chg):.2f}%",
-            "color":   _chg_color(dxy_chg),
-            "impact":  impacts.get("dxy_impact", ""),
-            "border":  _chg_color(dxy_chg),
-        })
+            impact_text = impacts.get(f"{key}_impact", "") if is_paid else "🔒 Upgrade for impact"
 
-    if btc.get("ok"):
-        _usdngn  = dxy.get("price", 0) if dxy.get("ok") else 0
-        _btc_ngn = btc["price"] * _usdngn if _usdngn > 0 else 0
-        _ngn_sub = f"≈{_compact(_btc_ngn, 'N')}" if _btc_ngn > 0 else ""
-        tiles.append({
-            "label":   "BITCOIN",
-            "value":   _compact(btc['price'], "$"),
-            "sub":     _ngn_sub,
-            "change":  f"{_arrow(btc_chg)} {abs(btc_chg):.2f}%",
-            "color":   _chg_color(btc_chg),
-            "impact":  impacts.get("btc_impact", ""),
-            "border":  _chg_color(btc_chg),
-        })
+            tiles.append(f"""
+                <div class="ngx-card" style="border-top: 2px solid {col}">
+                    <div class="ngx-label">{label}</div>
+                    <div class="ngx-price-xl">{display_val}</div>
+                    <div style="display:flex; justify-content: space-between; align-items: flex-end;">
+                        <div class="ngx-pct" style="color: {col}">{arr} {abs(chg):.1f}%</div>
+                        <div style="font-size: 18px; opacity: 0.3;">{label.split()[0]}</div>
+                    </div>
+                </div>
+            """)
 
-    if fg.get("ok"):
-        fg_col = _mood_color(impacts.get("fg_mood", "neutral"))
-        tiles.append({
-            "label":   "FEAR & GREED",
-            "value":   str(int(fg_score)),
-            "sub":     fg_label.upper(),
-            "change":  f"/ 100",
-            "color":   fg_col,
-            "impact":  impacts.get("fg_impact", ""),
-            "border":  fg_col,
-        })
-
-    if not tiles:
-        return
-
-    # ══════════════════════════════════════════════════════════════════════════
-    # PREMIUM TILE RENDERER  — Bloomberg/TradingView fintech standard
-    # Numbers dominate. Labels whisper. Cards stay tight.
-    # ══════════════════════════════════════════════════════════════════════════
-    def _tile_html(t: dict) -> str:
-        border_col = t["border"]
-
-        # ── Naira sub-value (BTC only, shown in green) ─────────────────────
-        sub_html = ""
-        if t.get("sub"):
-            sub_color = "#22C55E" if t["label"] == "BITCOIN" else "#9CA3AF"
-            sub_html  = f'<div class="ngx-sub" style="color:{sub_color};">{t["sub"]}</div>'
-
-        # ── Impact text (paid = plain English, free = upgrade prompt) ──────
-        if is_paid:
-            impact_html = f'<div class="ngx-impact">{t["impact"]}</div>'
-        else:
-            impact_html = '<div class="ngx-impact ngx-impact-locked">🔒 Upgrade to unlock Naira impact</div>'
-
-        return (
-            f'<div class="ngx-card" style="border-top-color:{border_col};">'
-            f'  <div class="ngx-card-top">'
-            f'    <div class="ngx-label">{t["label"]}</div>'
-            f'    <div class="ngx-price-xl" style="color:#FFFFFF;">{t["value"]}</div>'
-            f'    {sub_html}'
-            f'    <div class="ngx-pct" style="color:{t["color"]};">{t["change"]}</div>'
-            f'  </div>'
-            f'  {impact_html}'
-            f'</div>'
-        )
-
-    tiles_html = "\n".join(_tile_html(t) for t in tiles)
-
-    # ── Summary section ────────────────────────────────────────────────────────
-    if is_paid:
-        summary  = impacts.get("summary", "")
-        source   = impacts.get("source", "rules")
-        ai_badge = (
-            '<span class="gp-ai-badge">✦ AI</span>'
-            if source in ("gemini", "groq") else ""
-        )
-        summary_section = (
-            f'<div class="gp-summary">'
-            f'  <span class="gp-summary-label">Today\'s NGX Context {ai_badge}</span>'
-            f'  <div class="gp-summary-text">{summary}</div>'
-            f'</div>'
-        )
-    else:
-        summary_section = (
-            '<div class="gp-upgrade">'
-            '🔒 <strong style="color:#F0A500;">Upgrade to Starter</strong> — '
-            'unlock what these global signals mean for your Naira and NGX portfolio'
-            '</div>'
-        )
-
-    updated_at = pulse.get("fetched_at", "")
-
+    # Render Header
     st.markdown(f"""
-<style>
-@import url('https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500;600&family=Syne:wght@700;800&display=swap');
+    <div class="gp-container">
+        <div style="display:flex; justify-content:space-between; align-items:baseline;">
+            <div style="font-family:'Syne',sans-serif; font-size:16px; font-weight:800; color:white;">🌍 GLOBAL PULSE</div>
+            <div style="font-size:10px; color:#4B5563; font-family:'DM Mono';">UPDATED {pulse.get('fetched_at','')}</div>
+        </div>
+        <div class="ngx-grid">
+            {''.join(tiles)}
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
 
-/* ════════════════════════════════════════════════
-   GLOBAL PULSE — Premium Fintech Layout
-   Scope: .gp-wrap and descendants only
-   ════════════════════════════════════════════════ */
-
-.gp-wrap {{
-  margin: 14px 0 4px 0;
-}}
-
-/* ── Header row ── */
-.gp-header {{
-  display: flex;
-  align-items: baseline;
-  justify-content: space-between;
-  flex-wrap: wrap;
-  gap: 4px;
-  margin-bottom: 2px;
-}}
-.gp-title {{
-  font-family: 'Syne', sans-serif;
-  font-size: 15px;
-  font-weight: 800;
-  color: #FFFFFF;
-  letter-spacing: -0.02em;
-}}
-.gp-updated {{
-  font-family: 'DM Mono', monospace;
-  font-size: 9px;
-  color: #2D3748;
-  white-space: nowrap;
-}}
-.gp-subtitle {{
-  font-family: 'DM Mono', monospace;
-  font-size: 10px;
-  color: #4B5563;
-  margin-bottom: 7px;
-  line-height: 1.5;
-}}
-
-/* ── Track pills ── */
-.gp-pills {{
-  display: flex;
-  flex-wrap: wrap;
-  gap: 4px;
-  margin-bottom: 9px;
-}}
-.gp-pill {{
-  font-family: 'DM Mono', monospace;
-  font-size: 9px;
-  color: #4B5563;
-  background: #0A0C0F;
-  border: 1px solid #1A1D24;
-  border-radius: 20px;
-  padding: 2px 7px;
-  white-space: nowrap;
-}}
-
-/* ── 2×2 tile grid ── */
-.gp-grid {{
-  display: grid;
-  grid-template-columns: repeat(2, 1fr);
-  gap: 7px;
-}}
-
-/* ════════════════════════════════════════════════
-   INDIVIDUAL TILE — Data-First Design
-   Hierarchy: label (whisper) → price (dominant) → change
-   ════════════════════════════════════════════════ */
-.ngx-card {{
-  background: #06080B;
-  border: 1px solid #181B22;
-  border-top: 2px solid #374151;   /* overridden inline */
-  border-radius: 10px;
-  padding: 10px 11px 8px 11px;
-  display: flex;
-  flex-direction: column;
-  justify-content: space-between;
-  box-sizing: border-box;
-  overflow: hidden;
-  /* No fixed height — let content breathe naturally */
-  min-height: 95px;
-}}
-
-/* Top section: label + number + change stacked tight */
-.ngx-card-top {{
-  display: flex;
-  flex-direction: column;
-  gap: 0px;
-}}
-
-/* ── Label — small, muted, all-caps ── */
-.ngx-label {{
-  font-family: 'DM Mono', monospace;
-  font-size: 8.5px;
-  font-weight: 500;
-  color: #374151;
-  text-transform: uppercase;
-  letter-spacing: 0.12em;
-  line-height: 1;
-  margin-bottom: 4px;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}}
-
-/* ── Primary price number — DOMINANT ── */
-.ngx-price-xl {{
-  font-family: 'DM Mono', monospace;
-  font-size: clamp(22px, 5.5vw, 32px);
-  font-weight: 600;
-  line-height: 1;
-  letter-spacing: -0.04em;
-  color: #FFFFFF;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  display: block;
-  margin-bottom: 2px;
-  /* Subtle scale lift — does not affect layout */
-  transform: scaleX(1.02);
-  transform-origin: left center;
-}}
-
-/* ── BTC Naira sub-value ── */
-.ngx-sub {{
-  font-family: 'DM Mono', monospace;
-  font-size: 10px;
-  font-weight: 600;
-  line-height: 1;
-  letter-spacing: -0.02em;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  margin-bottom: 3px;
-}}
-
-/* ── % Change row ── */
-.ngx-pct {{
-  font-family: 'DM Mono', monospace;
-  font-size: 12px;
-  font-weight: 600;
-  line-height: 1;
-  letter-spacing: 0em;
-  white-space: nowrap;
-  margin-top: 1px;
-}}
-
-/* ── Naira impact text (paid) ── */
-.ngx-impact {{
-  font-family: 'DM Mono', monospace;
-  font-size: 9px;
-  color: #4B5563;
-  line-height: 1.4;
-  margin-top: 7px;
-  padding-top: 6px;
-  border-top: 1px solid #0F1218;
-  display: -webkit-box;
-  -webkit-line-clamp: 2;
-  -webkit-box-orient: vertical;
-  overflow: hidden;
-}}
-.ngx-impact-locked {{
-  color: #2D3748;
-  font-size: 8.5px;
-}}
-
-/* ── Summary block ── */
-.gp-summary {{
-  background: #060910;
-  border: 1px solid #181B22;
-  border-left: 3px solid #F0A500;
-  border-radius: 8px;
-  padding: 10px 13px;
-  margin-top: 8px;
-}}
-.gp-summary-label {{
-  font-family: 'DM Mono', monospace;
-  font-size: 8.5px;
-  color: #F0A500;
-  text-transform: uppercase;
-  letter-spacing: 0.11em;
-  font-weight: 600;
-  display: block;
-  margin-bottom: 5px;
-}}
-.gp-summary-text {{
-  font-family: 'DM Mono', monospace;
-  font-size: 11.5px;
-  color: #C8C4BC;
-  line-height: 1.65;
-}}
-.gp-ai-badge {{
-  font-size: 8.5px;
-  color: #22C55E;
-  margin-left: 4px;
-}}
-.gp-upgrade {{
-  background: #0A0800;
-  border: 1px solid rgba(240,165,0,.1);
-  border-radius: 8px;
-  padding: 9px 13px;
-  margin-top: 8px;
-  font-family: 'DM Mono', monospace;
-  font-size: 11px;
-  color: #6B7280;
-  text-align: center;
-}}
-
-/* ════════════════════════════════════════════════
-   RESPONSIVE — mobile-first number scaling
-   ════════════════════════════════════════════════ */
-@media (max-width: 480px) {{
-  .ngx-price-xl {{
-    font-size: clamp(20px, 7vw, 28px);
-    letter-spacing: -0.03em;
-  }}
-  .ngx-pct {{
-    font-size: 11px;
-  }}
-  .ngx-label {{
-    font-size: 8px;
-  }}
-  .ngx-impact {{
-    font-size: 8.5px;
-  }}
-  .gp-grid {{
-    gap: 6px;
-  }}
-}}
-
-@media (min-width: 900px) {{
-  .ngx-price-xl {{
-    font-size: 34px;
-    letter-spacing: -0.05em;
-  }}
-  .ngx-pct {{
-    font-size: 13px;
-  }}
-  .gp-grid {{
-    grid-template-columns: repeat(4, 1fr);
-  }}
-}}
-</style>
-
-<div class="gp-wrap">
-  <div class="gp-header">
-    <span class="gp-title">🌍 Global Pulse</span>
-    <span class="gp-updated">Updated {updated_at}</span>
-  </div>
-  <div class="gp-subtitle">
-    How world markets are moving today — and what it means for your Naira and NGX portfolio.
-  </div>
-  <div class="gp-pills">
-    <span class="gp-pill">🛢️ Brent Crude</span>
-    <span class="gp-pill">💵 USD/NGN</span>
-    <span class="gp-pill">₿ Bitcoin</span>
-    <span class="gp-pill">🌍 Fear &amp; Greed</span>
-  </div>
-  <div class="gp-grid">
-    {tiles_html}
-  </div>
-  {summary_section}
-</div>
-<div style="height:8px;"></div>
-""", unsafe_allow_html=True)
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# SIGNALS PAGE: per-card sector context
-# ══════════════════════════════════════════════════════════════════════════════
-
-# Pre-computed sector → global signal sensitivity map
-# Used for per-card context injection on signals page (paid only)
-_SECTOR_SENSITIVITY = {
-    "Banking":       {"oil": 0.3, "dxy": 0.7, "btc": 0.2},
-    "Finance":       {"oil": 0.3, "dxy": 0.7, "btc": 0.2},
-    "Oil & Gas":     {"oil": 1.0, "dxy": 0.4, "btc": 0.1},
-    "Energy":        {"oil": 0.8, "dxy": 0.3, "btc": 0.1},
-    "Consumer Goods":{"oil": 0.4, "dxy": 0.8, "btc": 0.1},
-    "Telecoms":      {"oil": 0.2, "dxy": 0.5, "btc": 0.2},
-    "ICT":           {"oil": 0.2, "dxy": 0.4, "btc": 0.5},
-    "Cement":        {"oil": 0.5, "dxy": 0.6, "btc": 0.1},
-    "Construction":  {"oil": 0.5, "dxy": 0.5, "btc": 0.1},
-    "Agriculture":   {"oil": 0.3, "dxy": 0.6, "btc": 0.1},
-    "Healthcare":    {"oil": 0.2, "dxy": 0.7, "btc": 0.1},
-    "Insurance":     {"oil": 0.2, "dxy": 0.5, "btc": 0.2},
-    "Real Estate":   {"oil": 0.3, "dxy": 0.6, "btc": 0.2},
-    "Transportation":{"oil": 0.7, "dxy": 0.4, "btc": 0.1},
-}
-
-@st.cache_data(ttl=1800)
-def get_sector_global_context(sector: str, oil_chg: float,
-                               dxy_chg: float, btc_chg: float,
-                               fg_score: float) -> str:
-    """
-    Returns a plain-English single sentence connecting today's global market
-    to this specific NGX sector. Written for everyday Nigerian investors —
-    no jargon, no technical terms.
-    Cached 30 min — near-zero cost, just a dictionary lookup + simple maths.
-    """
-    s = _SECTOR_SENSITIVITY.get(sector, {"oil": 0.3, "dxy": 0.5, "btc": 0.2})
-
-    # Weighted score: positive = world conditions helping this sector today
-    score = (
-        s["oil"] * oil_chg / 3.0 +
-        s["dxy"] * (-dxy_chg) / 3.0 +   # dollar going up = costs more Naira = bad
-        s["btc"] * btc_chg / 5.0 +
-        (fg_score - 50) / 100.0
-    )
-
-    # ── Oil & Gas / Energy — oil price is the direct driver ──────────────────
-    if sector in ("Oil & Gas", "Energy"):
-        if oil_chg >= 2.0:
-            return f"🌍 World oil price is rising strongly today. That is good news for Nigerian oil companies — they earn more revenue per barrel."
-        elif oil_chg >= 0.5:
-            return f"🌍 Oil price is edging up today. Small positive for Nigerian energy companies like Seplat — their revenue improves when oil costs more."
-        elif oil_chg <= -2.0:
-            return f"🌍 Oil price is falling sharply today. That reduces revenue for Nigerian oil companies and puts pressure on their share prices."
-        elif oil_chg <= -0.5:
-            return f"🌍 Oil price is slightly down today. Mild pressure on Nigerian energy stocks — their earnings are tied to the oil price."
-        else:
-            return f"🌍 Oil price is steady today. No major global pressure on Nigerian energy stocks from the world market."
-
-    # ── Consumer Goods / Healthcare / Cement — dollar rate is the key driver ──
-    if sector in ("Consumer Goods", "Healthcare", "Cement", "Construction"):
-        if dxy_chg >= 1.0:
-            return f"🌍 The dollar is getting more expensive today. Companies in this sector that import raw materials will face higher costs — that can squeeze their profits."
-        elif dxy_chg >= 0.3:
-            return f"🌍 The Naira has weakened slightly today. Companies that buy goods from abroad may pay a little more, which can reduce profit margins."
-        elif dxy_chg <= -1.0:
-            return f"🌍 The Naira is strengthening today. Companies that import materials will pay less — that is good for their profits and this sector generally."
-        elif dxy_chg <= -0.3:
-            return f"🌍 Dollar is slightly cheaper today. Small relief for companies in this sector that rely on imported materials."
-        else:
-            return f"🌍 The dollar/Naira rate is stable today. No extra pressure on import costs for this sector."
-
-    # ── Banking / Finance — both dollar and global mood matter ───────────────
-    if sector in ("Banking", "Finance"):
-        if dxy_chg >= 0.5 and fg_score < 50:
-            return f"🌍 Dollar rising and global investors are cautious today. Foreign money tends to leave emerging markets like Nigeria in this environment — watch banking stocks."
-        elif dxy_chg <= -0.5 and fg_score >= 50:
-            return f"🌍 Dollar weakening and global mood is positive. Foreign investors may look to put money into markets like Nigeria — good environment for banking stocks."
-        elif fg_score >= 65:
-            return f"🌍 Global investor confidence is high today. When the world is feeling positive, foreign money flows into emerging markets like Nigeria, which helps banking stocks."
-        elif fg_score <= 35:
-            return f"🌍 Global investors are nervous today. In uncertain times, foreign money tends to move away from markets like Nigeria — be cautious with banking stocks."
-        else:
-            return f"🌍 Global conditions are mixed today. No strong signal from the outside world pushing banking stocks in either direction."
-
-    # ── Telecoms / ICT — less directly affected, but global mood matters ─────
-    if sector in ("Telecoms", "ICT", "Technology"):
-        if fg_score >= 65:
-            return f"🌍 Investors globally are feeling confident today. Tech and telecoms companies tend to do better when global risk appetite is high."
-        elif fg_score <= 35:
-            return f"🌍 Investors are being cautious globally today. Growth sectors like telecoms and tech can feel this pressure."
-        else:
-            return f"🌍 Global market mood is neutral today — no major outside push for or against telecom stocks."
-
-    # ── Transportation / Agriculture — oil cost is a key input ───────────────
-    if sector in ("Transportation", "Agriculture"):
-        if oil_chg >= 1.0:
-            return f"🌍 Oil is rising today. Higher oil means higher fuel costs for this sector, which can squeeze profits."
-        elif oil_chg <= -1.0:
-            return f"🌍 Oil is falling today. Lower fuel costs are good news for this sector — running costs go down."
-        else:
-            return f"🌍 Oil price is steady today — fuel costs for this sector are not under pressure from the global market."
-
-    # ── Generic fallback for all other sectors ────────────────────────────────
-    if score >= 0.5:
-        return f"🌍 World markets are moving in a positive direction today. That creates a good backdrop for Nigerian stocks generally, including this sector."
-    elif score <= -0.5:
-        return f"🌍 Global conditions are challenging today. When the world faces uncertainty, it often affects Nigerian stocks too — be selective."
+    # Summary Section (Paid Only)
+    if is_paid:
+        st.markdown(f"""
+        <div style="background:#080A0D; border:1px solid #1E2229; border-left:4px solid #F0A500; 
+                    padding:12px; border-radius:8px; font-family:'DM Mono'; font-size:13px; color:#C8C4BC;">
+            <span style="color:#F0A500; font-weight:bold; font-size:10px; text-transform:uppercase;">Market Intelligence:</span><br>
+            {impacts.get('summary', '')}
+        </div>
+        """, unsafe_allow_html=True)
     else:
-        return f"🌍 World markets are quiet today — no strong signal from the outside world pushing this sector in either direction."
+        st.markdown("""
+        <div style="text-align:center; padding:10px; border:1px dashed #374151; border-radius:8px; font-size:11px; color:#6B7280;">
+            🔒 Unlock <b>Naira Impact Analysis</b> with any paid plan.
+        </div>
+        """, unsafe_allow_html=True)
