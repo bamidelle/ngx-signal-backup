@@ -123,20 +123,22 @@ def _fetch_fear_greed() -> dict:
 @st.cache_data(ttl=1800)
 def fetch_global_pulse_data() -> dict:
     """
-    Master data fetch — all four signals in one cached call.
-    Returns a dict with keys: oil, dxy, btc, fg  (fear/greed)
+    Master data fetch — all five signals in one cached call.
+    Returns a dict with keys: oil, dxy, btc, fg, gold
     Each sub-dict always has at least {"ok": bool}.
     """
-    oil = _fetch_yahoo_quote("BZ=F")     # Brent Crude Futures
-    dxy = _fetch_yahoo_quote("USDNGN=X") # USD to Naira live rate
-    btc = _fetch_bitcoin()
-    fg  = _fetch_fear_greed()
+    oil  = _fetch_yahoo_quote("BZ=F")     # Brent Crude Futures
+    dxy  = _fetch_yahoo_quote("USDNGN=X") # USD to Naira live rate
+    btc  = _fetch_bitcoin()
+    fg   = _fetch_fear_greed()
+    gold = _fetch_yahoo_quote("GC=F")     # Gold Futures (USD/oz)
 
     return {
-        "oil": {**oil, "ok": bool(oil.get("price"))},
-        "dxy": {**dxy, "ok": bool(dxy.get("price"))},
-        "btc": {**btc, "ok": bool(btc.get("price"))},
-        "fg":  {**fg,  "ok": bool(fg.get("score") is not None)},
+        "oil":  {**oil,  "ok": bool(oil.get("price"))},
+        "dxy":  {**dxy,  "ok": bool(dxy.get("price"))},
+        "btc":  {**btc,  "ok": bool(btc.get("price"))},
+        "fg":   {**fg,   "ok": bool(fg.get("score") is not None)},
+        "gold": {**gold, "ok": bool(gold.get("price"))},
         "fetched_at": _now_wat().strftime("%I:%M %p WAT"),
     }
 
@@ -194,11 +196,13 @@ def _rule_based_naira_impact(data: dict) -> dict:
     dxy  = data.get("dxy", {})
     btc  = data.get("btc", {})
     fg   = data.get("fg", {})
+    gold = data.get("gold", {})
 
-    oil_chg = oil.get("change_pct", 0)
-    dxy_chg = dxy.get("change_pct", 0)
-    btc_chg = btc.get("change_pct", 0)
+    oil_chg  = oil.get("change_pct", 0)
+    dxy_chg  = dxy.get("change_pct", 0)
+    btc_chg  = btc.get("change_pct", 0)
     fg_score = fg.get("score", 50)
+    gold_chg = gold.get("change_pct", 0)
 
     # ── Oil impact ────────────────────────────────────────────────────────────
     if oil_chg >= 2.0:
@@ -278,6 +282,28 @@ def _rule_based_naira_impact(data: dict) -> dict:
     if fg.get("label"):
         fg_label = fg["label"].title()
 
+    # ── Gold impact ───────────────────────────────────────────────────────────
+    gold_price = gold.get("price", 0)
+    _usdngn_g  = data.get("dxy", {}).get("price", 0)
+    _gold_ngn  = int(gold_price * _usdngn_g) if _usdngn_g > 0 and gold_price > 0 else 0
+    _gold_ngn_str = f"N{_gold_ngn:,}/oz" if _gold_ngn > 0 else ""
+
+    if gold_chg >= 2.0:
+        gold_impact = f"Gold surging — investors are fleeing to safety globally. This often signals stress in equity markets. Be selective on NGX today."
+        gold_mood   = "negative"   # gold up = risk-off = bad for equities
+    elif gold_chg >= 0.5:
+        gold_impact = f"Gold edging higher — mild risk-off tone globally. Watch defensive stocks on NGX and avoid high-risk positions."
+        gold_mood   = "neutral"
+    elif gold_chg <= -2.0:
+        gold_impact = f"Gold falling sharply — investors are moving into riskier assets. Positive signal for equity markets including NGX."
+        gold_mood   = "positive"
+    elif gold_chg <= -0.5:
+        gold_impact = f"Gold slipping — risk appetite is improving globally. Mild positive for NGX growth stocks."
+        gold_mood   = "positive"
+    else:
+        gold_impact = f"Gold is steady — no major flight-to-safety signal from global markets today."
+        gold_mood   = "neutral"
+
     # ── Master summary sentence ───────────────────────────────────────────────
     positives = sum(1 for m in [oil_mood, dxy_mood, btc_mood, fg_mood] if m == "positive")
     negatives = sum(1 for m in [oil_mood, dxy_mood, btc_mood, fg_mood] if m == "negative")
@@ -329,6 +355,9 @@ def _rule_based_naira_impact(data: dict) -> dict:
         "fg_impact":   fg_impact,
         "fg_mood":     fg_mood,
         "fg_label":    fg_label,
+        "gold_impact": gold_impact,
+        "gold_mood":   gold_mood,
+        "gold_ngn":    _gold_ngn_str,
         "summary":     summary,
         "source":      "rules",
     }
@@ -537,11 +566,13 @@ def get_global_pulse_for_ai(pulse: dict | None = None) -> str:
         dxy     = data.get("dxy", {})
         btc     = data.get("btc", {})
         fg      = data.get("fg", {})
+        gold = data.get("gold", {})
         return (
             f"\nGLOBAL MARKET CONTEXT (today):\n"
             f"- Brent Crude Oil: ${oil.get('price', 0):.2f} ({oil.get('change_pct', 0):+.2f}%)\n"
             f"- USD/NGN Rate: N{dxy.get('price', 0):,.0f} per dollar ({dxy.get('change_pct', 0):+.2f}%)\n"
             f"- Bitcoin: ${btc.get('price', 0):,.0f} ({btc.get('change_pct', 0):+.2f}%)\n"
+            f"- Gold: ${gold.get('price', 0):,.0f}/oz ({gold.get('change_pct', 0):+.2f}%)\n"
             f"- Global mood: {fg.get('label', 'Neutral')} ({fg.get('score', 50)}/100)\n"
             f"- Nigerian context: {impacts.get('summary', '')}\n"
         )
@@ -581,12 +612,14 @@ def render_global_pulse_strip(tier: str, location: str = "home") -> None:
     dxy  = data.get("dxy", {})
     btc  = data.get("btc", {})
     fg   = data.get("fg", {})
+    gold = data.get("gold", {})
 
     oil_chg  = oil.get("change_pct", 0)
     dxy_chg  = dxy.get("change_pct", 0)
     btc_chg  = btc.get("change_pct", 0)
     fg_score = fg.get("score", 50)
     fg_label = impacts.get("fg_label", fg.get("label", "Neutral"))
+    gold_chg = gold.get("change_pct", 0)
 
     def _arrow(v):
         return "▲" if v > 0 else "▼" if v < 0 else "–"
@@ -706,6 +739,21 @@ def render_global_pulse_strip(tier: str, location: str = "home") -> None:
             "impact": impacts.get("fg_impact", ""),
         })
 
+    if gold.get("ok"):
+        _usdngn_now = dxy.get("price", 0) if dxy.get("ok") else 0
+        _gold_ngn   = int(gold["price"] * _usdngn_now) if _usdngn_now > 0 else 0
+        _gold_ngn_str = f"N{_gold_ngn:,}/oz" if _gold_ngn > 0 else impacts.get("gold_ngn", "")
+        tiles.append({
+            "icon":   "🥇",
+            "label":  "Gold / oz",
+            "value":  f"${gold['price']:,.0f}",
+            "ngn":    _gold_ngn_str,
+            "change": f"{_arrow(gold_chg)} {abs(gold_chg):.2f}%",
+            "color":  _chg_color(gold_chg),
+            "mood":   impacts.get("gold_mood", "neutral"),
+            "impact": impacts.get("gold_impact", ""),
+        })
+
     if not tiles:
         return   # all APIs failed — render nothing rather than an empty card
 
@@ -741,42 +789,50 @@ def render_global_pulse_strip(tier: str, location: str = "home") -> None:
         return raw
 
     # ── Premium tile HTML builder ──────────────────────────────────────────────
+    # BUG FIX: Streamlit's DOMPurify strips dynamic class names like
+    # class="gp-pct gp-pct-up" when built via f-string interpolation.
+    # Solution: use inline style="color:..." for the change % color.
+    # CSS classes (gp-label, gp-price-xl, etc.) still apply for layout/font.
     def _tile_html(t: dict) -> str:
-        border_col = t["color"]
+        border_col  = t["color"]
+        chg_color   = t["color"]   # inline color — bypasses sanitizer
         display_val = _fmt_value(t["value"])
+        change_txt  = t["change"]
+        icon        = t["icon"]
+        label       = t["label"]
 
-        # Naira conversion sub-line — Bitcoin tile only
+        # Naira sub-line — Bitcoin AND Gold tiles
         ngn_line = ""
         if t.get("ngn"):
-            ngn_fmt = _fmt_value(t["ngn"].replace("≈", "").strip())
+            ngn_raw = t["ngn"]
+            # Strip leading ≈ if present, reformat, re-add ≈
+            bare    = ngn_raw.lstrip("≈").strip()
+            ngn_fmt = _fmt_value(bare)
             ngn_line = (
-                f'<div class="gp-ngn-line">≈{ngn_fmt}</div>'
+                '<div class="gp-ngn-line">' + "≈" + ngn_fmt + '</div>'
             )
 
-        # Change row — arrow + pct
-        chg_class = "gp-pct-up" if t["color"] == "#22C55E" else (
-                    "gp-pct-dn" if t["color"] == "#EF4444" else "gp-pct-nt")
-
-        # Impact / lock section
+        # Impact / lock — built as plain string, no f-string class interpolation
         if is_paid:
-            impact_section = (
-                f'<div class="gp-impact-text">{t["impact"]}</div>'
-            )
+            impact_text    = t.get("impact", "")
+            impact_section = '<div class="gp-impact-text">' + impact_text + '</div>'
         else:
-            impact_section = (
-                '<div class="gp-impact-lock">🔒 Naira impact — paid plan</div>'
-            )
+            impact_section = '<div class="gp-impact-lock">🔒 Naira impact — paid plan</div>'
 
-        return f"""
-<div class="ngx-card gp-tile" style="border-top:2px solid {border_col};">
-  <div class="gp-tile-top">
-    <div class="gp-label">{t['icon']}&nbsp;{t['label']}</div>
-    <div class="gp-price-xl">{display_val}</div>
-    {ngn_line}
-    <div class="gp-pct {chg_class}">{t['change']}</div>
-  </div>
-  {impact_section}
-</div>"""
+        # Assemble tile — ALL dynamic values injected as plain string concat
+        # NOT as f-string class attributes (that is what caused the original bug)
+        tile = (
+            '<div class="ngx-card gp-tile" style="border-top:2px solid ' + border_col + ';">' +
+            '<div class="gp-tile-top">' +
+            '<div class="gp-label">' + icon + "&nbsp;" + label + '</div>' +
+            '<div class="gp-price-xl">' + display_val + '</div>' +
+            ngn_line +
+            '<div class="gp-pct" style="color:' + chg_color + ';">' + change_txt + '</div>' +
+            '</div>' +
+            impact_section +
+            '</div>'
+        )
+        return tile
 
     tiles_html = "\n".join(_tile_html(t) for t in tiles)
 
@@ -841,14 +897,17 @@ def render_global_pulse_strip(tier: str, location: str = "home") -> None:
     border-radius:20px;padding:2px 8px;
   }}
 
-  /* ── Premium tile grid ──────────────────────────────────────────────── */
+  /* ── Premium tile grid — 5 tiles ────────────────────────────────────── */
   .gp-grid {{
     display:grid;
     grid-template-columns:repeat(2, 1fr);
     gap:8px;
   }}
-  @media (min-width:640px) {{
-    .gp-grid {{ grid-template-columns:repeat(4, 1fr); }}
+  @media (min-width:480px) {{
+    .gp-grid {{ grid-template-columns:repeat(3, 1fr); }}
+  }}
+  @media (min-width:760px) {{
+    .gp-grid {{ grid-template-columns:repeat(5, 1fr); }}
   }}
 
   /* ── Individual tile ────────────────────────────────────────────────── */
@@ -975,6 +1034,7 @@ def render_global_pulse_strip(tier: str, location: str = "home") -> None:
     <span class="gp-pill">💵 USD/NGN</span>
     <span class="gp-pill">₿ Bitcoin</span>
     <span class="gp-pill">🌍 Fear &amp; Greed</span>
+    <span class="gp-pill">🥇 Gold</span>
   </div>
   <div class="gp-grid">
     {tiles_html}
