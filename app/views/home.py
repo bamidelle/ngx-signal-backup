@@ -1990,11 +1990,6 @@ html,body{{background:transparent;font-family:'DM Mono',monospace;overflow-x:hid
       <span class="callout-icon">&#128161;</span>
       <span class="callout-text" style="color:#86EFAC;">{_action}</span>
     </div>
-    <div class="sec-lbl"><div class="sec-line"></div>Global Pulse — Market Context Today<div class="sec-line"></div></div>
-    <div class="ctx-box">
-      <span class="callout-icon">&#127757;</span>
-      <span class="ctx-text">{_context}</span>
-    </div>
     <div class="sec-lbl"><div class="sec-line"></div>Global Pulse Impact on {sym}<div class="sec-line"></div></div>
     <div class="callout" style="background:#0A0D15;border:1px solid #3B82F630;">
       <span class="callout-icon">&#127758;</span>
@@ -2134,10 +2129,6 @@ function buildExportCard() {{
         <span>💡</span><span>{_action}</span>
       </div>
 
-      <div style="font-size:9px;color:#9CA3AF;text-transform:uppercase;letter-spacing:.15em;text-align:center;margin-bottom:10px;">Global Pulse — Market Context Today</div>
-      <div style="background:#EFF6FF;border:1px solid #BFDBFE;border-radius:10px;padding:12px 14px;margin-bottom:14px;display:flex;gap:10px;font-size:12px;color:#1E40AF;line-height:1.65;">
-        <span>🌍</span><span>{_context}</span>
-      </div>
       <div style="font-size:9px;color:#9CA3AF;text-transform:uppercase;letter-spacing:.15em;text-align:center;margin-bottom:10px;">Global Pulse Impact on {sym}</div>
       <div style="background:#EFF6FF;border:1px solid #BFDBFE;border-radius:10px;padding:12px 14px;margin-bottom:20px;display:flex;gap:10px;font-size:12px;color:#1E40AF;line-height:1.65;">
         <span>🌐</span><span>{_spotlight_impact}</span>
