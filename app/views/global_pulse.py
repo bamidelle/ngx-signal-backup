@@ -286,7 +286,7 @@ def _rule_based_naira_impact(data: dict) -> dict:
     gold_price = gold.get("price", 0)
     _usdngn_g  = data.get("dxy", {}).get("price", 0)
     _gold_ngn  = int(gold_price * _usdngn_g) if _usdngn_g > 0 and gold_price > 0 else 0
-    _gold_ngn_str = f"N{_gold_ngn:,}/oz" if _gold_ngn > 0 else ""
+    _gold_ngn_str = f"≈N{_gold_ngn:,}/oz" if _gold_ngn > 0 else ""
 
     if gold_chg >= 2.0:
         gold_impact = f"Gold surging — investors are fleeing to safety globally. This often signals stress in equity markets. Be selective on NGX today."
@@ -692,7 +692,7 @@ def render_global_pulse_strip(tier: str, location: str = "home") -> None:
     if oil.get("ok"):
         tiles.append({
             "icon":   "🛢️",
-            "label":  "Crude Oil",
+            "label":  "Crude Oil Price Today",
             "value":  f"${oil['price']:.2f}",
             "change": f"{_arrow(oil_chg)} {abs(oil_chg):.2f}%",
             "color":  _chg_color(oil_chg),
@@ -703,7 +703,7 @@ def render_global_pulse_strip(tier: str, location: str = "home") -> None:
     if dxy.get("ok"):
         tiles.append({
             "icon":   "💵",
-            "label":  "USD / Naira Rate",
+            "label":  "USD to Naira Rate Today",
             "value":  f"N{dxy['price']:,.0f}",
             "change": f"{_arrow(dxy_chg)} {abs(dxy_chg):.2f}%",
             "color":  _chg_color(dxy_chg),
@@ -718,7 +718,7 @@ def render_global_pulse_strip(tier: str, location: str = "home") -> None:
         _btc_ngn_str = f"≈N{_btc_ngn:,}" if _btc_ngn > 0 else ""
         tiles.append({
             "icon":    "₿",
-            "label":   "Bitcoin",
+            "label":   "Bitcoin Price in Naira Today",
             "value":   f"${btc['price']:,.0f}",
             "ngn":     _btc_ngn_str,
             "change":  f"{_arrow(btc_chg)} {abs(btc_chg):.2f}%",
@@ -742,10 +742,10 @@ def render_global_pulse_strip(tier: str, location: str = "home") -> None:
     if gold.get("ok"):
         _usdngn_now = dxy.get("price", 0) if dxy.get("ok") else 0
         _gold_ngn   = int(gold["price"] * _usdngn_now) if _usdngn_now > 0 else 0
-        _gold_ngn_str = f"N{_gold_ngn:,}/oz" if _gold_ngn > 0 else impacts.get("gold_ngn", "")
+        _gold_ngn_str = f"≈N{_gold_ngn:,}/oz" if _gold_ngn > 0 else impacts.get("gold_ngn", "")
         tiles.append({
             "icon":   "🥇",
-            "label":  "Gold / oz",
+            "label":  "Gold Price Today",
             "value":  f"${gold['price']:,.0f}",
             "ngn":    _gold_ngn_str,
             "change": f"{_arrow(gold_chg)} {abs(gold_chg):.2f}%",
@@ -804,12 +804,14 @@ def render_global_pulse_strip(tier: str, location: str = "home") -> None:
         # Naira sub-line — Bitcoin AND Gold tiles
         ngn_line = ""
         if t.get("ngn"):
+            # Always display Naira conversions as FULL figures (no M/K abbreviation)
+            # so users see the exact amount e.g. ≈N133,450,000 not ≈N133.5M
             ngn_raw = t["ngn"]
-            # Strip leading ≈ if present, reformat, re-add ≈
-            bare    = ngn_raw.lstrip("≈").strip()
-            ngn_fmt = _fmt_value(bare)
+            # Ensure it has the ≈ prefix once
+            if not ngn_raw.startswith("≈"):
+                ngn_raw = "≈" + ngn_raw
             ngn_line = (
-                '<div class="gp-ngn-line">' + "≈" + ngn_fmt + '</div>'
+                '<div class="gp-ngn-line">' + ngn_raw + '</div>'
             )
 
         # Impact / lock — built as plain string, no f-string class interpolation
@@ -935,15 +937,18 @@ def render_global_pulse_strip(tier: str, location: str = "home") -> None:
   /* ── Typography hierarchy ───────────────────────────────────────────── */
   .gp-label {{
     font-family:'DM Mono',monospace;
-    font-size:9.5px;
+    font-size:8.5px;
     font-weight:500;
     color:#4B5563;
     text-transform:uppercase;
-    letter-spacing:.08em;
+    letter-spacing:.06em;
     margin-bottom:4px;
-    white-space:nowrap;
+    white-space:normal;
+    line-height:1.3;
     overflow:hidden;
-    text-overflow:ellipsis;
+    display:-webkit-box;
+    -webkit-line-clamp:2;
+    -webkit-box-orient:vertical;
     opacity:0.8;
   }}
 
