@@ -653,388 +653,324 @@ def render_global_pulse_strip(tier: str, location: str = "home") -> None:
 
     # ── HOMEPAGE: full four-tile grid + summary ───────────────────────────────
 
-    # ── Compact number formatter ───────────────────────────────────────────────
-    def _compact(val: float, prefix: str = "") -> str:
-        """Convert large numbers to compact fintech format: 1540 → 1.54K etc."""
-        abs_val = abs(val)
-        if abs_val >= 1_000_000_000:
-            return f"{prefix}{val/1_000_000_000:.2f}B"
-        if abs_val >= 1_000_000:
-            return f"{prefix}{val/1_000_000:.2f}M"
-        if abs_val >= 10_000:
-            return f"{prefix}{val/1_000:.1f}K"
-        if abs_val >= 1_000:
-            return f"{prefix}{val/1_000:.2f}K"
-        return f"{prefix}{val:.2f}"
-
-    # ── Build tile data ────────────────────────────────────────────────────────
+    # Build tile data
     tiles = []
 
     if oil.get("ok"):
         tiles.append({
-            "label":   "BRENT CRUDE",
-            "value":   f"${oil['price']:.2f}",
-            "sub":     "",
-            "change":  f"{_arrow(oil_chg)} {abs(oil_chg):.2f}%",
-            "color":   _chg_color(oil_chg),
-            "impact":  impacts.get("oil_impact", ""),
-            "border":  _chg_color(oil_chg),
+            "icon":   "🛢️",
+            "label":  "Crude Oil",
+            "value":  f"${oil['price']:.2f}",
+            "change": f"{_arrow(oil_chg)} {abs(oil_chg):.2f}%",
+            "color":  _chg_color(oil_chg),
+            "mood":   impacts.get("oil_mood", "neutral"),
+            "impact": impacts.get("oil_impact", ""),
         })
 
     if dxy.get("ok"):
         tiles.append({
-            "label":   "USD / NGN",
-            "value":   _compact(dxy['price'], "N"),
-            "sub":     "",
-            "change":  f"{_arrow(dxy_chg)} {abs(dxy_chg):.2f}%",
-            "color":   _chg_color(dxy_chg),
-            "impact":  impacts.get("dxy_impact", ""),
-            "border":  _chg_color(dxy_chg),
+            "icon":   "💵",
+            "label":  "USD / Naira Rate",
+            "value":  f"N{dxy['price']:,.0f}",
+            "change": f"{_arrow(dxy_chg)} {abs(dxy_chg):.2f}%",
+            "color":  _chg_color(dxy_chg),
+            "mood":   impacts.get("dxy_mood", "neutral"),
+            "impact": impacts.get("dxy_impact", ""),
         })
 
     if btc.get("ok"):
-        _usdngn  = dxy.get("price", 0) if dxy.get("ok") else 0
-        _btc_ngn = btc["price"] * _usdngn if _usdngn > 0 else 0
-        _ngn_sub = f"≈{_compact(_btc_ngn, 'N')}" if _btc_ngn > 0 else ""
+        # Compute BTC in Naira using live USD/NGN rate
+        _usdngn = dxy.get("price", 0) if dxy.get("ok") else 0
+        _btc_ngn = int(btc["price"] * _usdngn) if _usdngn > 0 else 0
+        _btc_ngn_str = f"≈N{_btc_ngn:,}" if _btc_ngn > 0 else ""
         tiles.append({
-            "label":   "BITCOIN",
-            "value":   _compact(btc['price'], "$"),
-            "sub":     _ngn_sub,
+            "icon":    "₿",
+            "label":   "Bitcoin",
+            "value":   f"${btc['price']:,.0f}",
+            "ngn":     _btc_ngn_str,
             "change":  f"{_arrow(btc_chg)} {abs(btc_chg):.2f}%",
             "color":   _chg_color(btc_chg),
+            "mood":    impacts.get("btc_mood", "neutral"),
             "impact":  impacts.get("btc_impact", ""),
-            "border":  _chg_color(btc_chg),
         })
 
     if fg.get("ok"):
         fg_col = _mood_color(impacts.get("fg_mood", "neutral"))
         tiles.append({
-            "label":   "FEAR & GREED",
-            "value":   str(int(fg_score)),
-            "sub":     fg_label.upper(),
-            "change":  f"/ 100",
-            "color":   fg_col,
-            "impact":  impacts.get("fg_impact", ""),
-            "border":  fg_col,
+            "icon":   "🌍",
+            "label":  "Global Mood",
+            "value":  fg_label,
+            "change": f"{fg_score}/100",
+            "color":  fg_col,
+            "mood":   impacts.get("fg_mood", "neutral"),
+            "impact": impacts.get("fg_impact", ""),
         })
 
     if not tiles:
-        return
+        return   # all APIs failed — render nothing rather than an empty card
 
-    # ══════════════════════════════════════════════════════════════════════════
-    # PREMIUM TILE RENDERER  — Bloomberg/TradingView fintech standard
-    # Numbers dominate. Labels whisper. Cards stay tight.
-    # ══════════════════════════════════════════════════════════════════════════
+    # ── Premium fintech number formatter ──────────────────────────────────────
+    def _fmt_value(raw: str) -> str:
+        """
+        Shorten very long numbers to keep them legible at large font sizes.
+        e.g. $104,250,000 → $104.3M  |  ₿$103,450 → $103.5K  |  N1,580 → N1,580
+        Leaves short values (oil, FG label) untouched.
+        """
+        import re
+        # Only reformat numeric values that look like they could be long
+        m = re.match(r'^([$₦N₿≈]*)([\d,]+)(\.\d+)?(.*)$', raw.strip())
+        if not m:
+            return raw
+        prefix   = m.group(1)
+        int_part = m.group(2).replace(",", "")
+        dec_part = m.group(3) or ""
+        suffix   = m.group(4)
+        try:
+            val = float(int_part + dec_part)
+        except ValueError:
+            return raw
+        if val >= 1_000_000:
+            return f"{prefix}{val/1_000_000:.2f}M{suffix}"
+        if val >= 10_000:
+            # For USD/NGN (large naira numbers like 1,620) keep as-is with commas
+            # For BTC (e.g. $103,450) abbreviate to K
+            if prefix in ("$",) and val >= 10_000:
+                return f"{prefix}{val/1_000:.1f}K{suffix}"
+            # Naira rate — keep full number, add thousands comma if missing
+            return f"{prefix}{val:,.0f}{suffix}"
+        return raw
+
+    # ── Premium tile HTML builder ──────────────────────────────────────────────
     def _tile_html(t: dict) -> str:
-        border_col = t["border"]
+        border_col = t["color"]
+        display_val = _fmt_value(t["value"])
 
-        # ── Naira sub-value (BTC only, shown in green) ─────────────────────
-        sub_html = ""
-        if t.get("sub"):
-            sub_color = "#22C55E" if t["label"] == "BITCOIN" else "#9CA3AF"
-            sub_html  = f'<div class="ngx-sub" style="color:{sub_color};">{t["sub"]}</div>'
+        # Naira conversion sub-line — Bitcoin tile only
+        ngn_line = ""
+        if t.get("ngn"):
+            ngn_fmt = _fmt_value(t["ngn"].replace("≈", "").strip())
+            ngn_line = (
+                f'<div class="gp-ngn-line">≈{ngn_fmt}</div>'
+            )
 
-        # ── Impact text (paid = plain English, free = upgrade prompt) ──────
+        # Change row — arrow + pct
+        chg_class = "gp-pct-up" if t["color"] == "#22C55E" else (
+                    "gp-pct-dn" if t["color"] == "#EF4444" else "gp-pct-nt")
+
+        # Impact / lock section
         if is_paid:
-            impact_html = f'<div class="ngx-impact">{t["impact"]}</div>'
+            impact_section = (
+                f'<div class="gp-impact-text">{t["impact"]}</div>'
+            )
         else:
-            impact_html = '<div class="ngx-impact ngx-impact-locked">🔒 Upgrade to unlock Naira impact</div>'
+            impact_section = (
+                '<div class="gp-impact-lock">🔒 Naira impact — paid plan</div>'
+            )
 
-        return (
-            f'<div class="ngx-card" style="border-top-color:{border_col};">'
-            f'  <div class="ngx-card-top">'
-            f'    <div class="ngx-label">{t["label"]}</div>'
-            f'    <div class="ngx-price-xl" style="color:#FFFFFF;">{t["value"]}</div>'
-            f'    {sub_html}'
-            f'    <div class="ngx-pct" style="color:{t["color"]};">{t["change"]}</div>'
-            f'  </div>'
-            f'  {impact_html}'
-            f'</div>'
-        )
+        return f"""
+<div class="ngx-card gp-tile" style="border-top:2px solid {border_col};">
+  <div class="gp-tile-top">
+    <div class="gp-label">{t['icon']}&nbsp;{t['label']}</div>
+    <div class="gp-price-xl">{display_val}</div>
+    {ngn_line}
+    <div class="gp-pct {chg_class}">{t['change']}</div>
+  </div>
+  {impact_section}
+</div>"""
 
     tiles_html = "\n".join(_tile_html(t) for t in tiles)
 
-    # ── Summary section ────────────────────────────────────────────────────────
+    # ── Summary sentence (paid only) ──────────────────────────────────────────
     if is_paid:
-        summary  = impacts.get("summary", "")
-        source   = impacts.get("source", "rules")
-        ai_badge = (
-            '<span class="gp-ai-badge">✦ AI</span>'
+        summary = impacts.get("summary", "")
+        source  = impacts.get("source", "rules")
+        src_badge = (
+            '<span style="font-size:9px;color:#22C55E;margin-left:6px;">✦ AI</span>'
             if source in ("gemini", "groq") else ""
         )
-        summary_section = (
-            f'<div class="gp-summary">'
-            f'  <span class="gp-summary-label">Today\'s NGX Context {ai_badge}</span>'
-            f'  <div class="gp-summary-text">{summary}</div>'
-            f'</div>'
-        )
+        summary_section = f"""
+<div style="background:#080A0D;border:1px solid #1E2229;
+            border-left:3px solid #F0A500;border-radius:8px;
+            padding:11px 14px;margin-top:10px;
+            font-family:'DM Mono',monospace;font-size:12px;
+            color:#C8C4BC;line-height:1.7;">
+  <span style="font-size:9px;color:#F0A500;text-transform:uppercase;
+               letter-spacing:.09em;font-weight:600;">
+    Today's NGX Context{src_badge}
+  </span><br>
+  {summary}
+</div>"""
     else:
-        summary_section = (
-            '<div class="gp-upgrade">'
-            '🔒 <strong style="color:#F0A500;">Upgrade to Starter</strong> — '
-            'unlock what these global signals mean for your Naira and NGX portfolio'
-            '</div>'
-        )
+        summary_section = f"""
+<div style="background:#0A0800;border:1px solid rgba(240,165,0,.15);
+            border-radius:8px;padding:10px 14px;margin-top:10px;
+            font-family:'DM Mono',monospace;font-size:11px;
+            color:#6B7280;text-align:center;">
+  🔒 <strong style="color:#F0A500;">Upgrade to Starter</strong> —
+  unlock what these global signals mean for your Naira and NGX portfolio
+</div>"""
 
-    updated_at = pulse.get("fetched_at", "")
+    ai_note = (
+        f'<span style="font-size:9px;color:#374151;">Updated {pulse.get("fetched_at","")}</span>'
+    )
 
     st.markdown(f"""
 <style>
-@import url('https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500;600&family=Syne:wght@700;800&display=swap');
-
-/* ════════════════════════════════════════════════
-   GLOBAL PULSE — Premium Fintech Layout
-   Scope: .gp-wrap and descendants only
-   ════════════════════════════════════════════════ */
-
-.gp-wrap {{
-  margin: 14px 0 4px 0;
-}}
-
-/* ── Header row ── */
-.gp-header {{
-  display: flex;
-  align-items: baseline;
-  justify-content: space-between;
-  flex-wrap: wrap;
-  gap: 4px;
-  margin-bottom: 2px;
-}}
-.gp-title {{
-  font-family: 'Syne', sans-serif;
-  font-size: 15px;
-  font-weight: 800;
-  color: #FFFFFF;
-  letter-spacing: -0.02em;
-}}
-.gp-updated {{
-  font-family: 'DM Mono', monospace;
-  font-size: 9px;
-  color: #2D3748;
-  white-space: nowrap;
-}}
-.gp-subtitle {{
-  font-family: 'DM Mono', monospace;
-  font-size: 10px;
-  color: #4B5563;
-  margin-bottom: 7px;
-  line-height: 1.5;
-}}
-
-/* ── Track pills ── */
-.gp-pills {{
-  display: flex;
-  flex-wrap: wrap;
-  gap: 4px;
-  margin-bottom: 9px;
-}}
-.gp-pill {{
-  font-family: 'DM Mono', monospace;
-  font-size: 9px;
-  color: #4B5563;
-  background: #0A0C0F;
-  border: 1px solid #1A1D24;
-  border-radius: 20px;
-  padding: 2px 7px;
-  white-space: nowrap;
-}}
-
-/* ── 2×2 tile grid ── */
-.gp-grid {{
-  display: grid;
-  grid-template-columns: repeat(2, 1fr);
-  gap: 7px;
-}}
-
-/* ════════════════════════════════════════════════
-   INDIVIDUAL TILE — Data-First Design
-   Hierarchy: label (whisper) → price (dominant) → change
-   ════════════════════════════════════════════════ */
-.ngx-card {{
-  background: #06080B;
-  border: 1px solid #181B22;
-  border-top: 2px solid #374151;   /* overridden inline */
-  border-radius: 10px;
-  padding: 10px 11px 8px 11px;
-  display: flex;
-  flex-direction: column;
-  justify-content: space-between;
-  box-sizing: border-box;
-  overflow: hidden;
-  /* No fixed height — let content breathe naturally */
-  min-height: 95px;
-}}
-
-/* Top section: label + number + change stacked tight */
-.ngx-card-top {{
-  display: flex;
-  flex-direction: column;
-  gap: 0px;
-}}
-
-/* ── Label — small, muted, all-caps ── */
-.ngx-label {{
-  font-family: 'DM Mono', monospace;
-  font-size: 8.5px;
-  font-weight: 500;
-  color: #374151;
-  text-transform: uppercase;
-  letter-spacing: 0.12em;
-  line-height: 1;
-  margin-bottom: 4px;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}}
-
-/* ── Primary price number — DOMINANT ── */
-.ngx-price-xl {{
-  font-family: 'DM Mono', monospace;
-  font-size: clamp(22px, 5.5vw, 32px);
-  font-weight: 600;
-  line-height: 1;
-  letter-spacing: -0.04em;
-  color: #FFFFFF;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  display: block;
-  margin-bottom: 2px;
-  /* Subtle scale lift — does not affect layout */
-  transform: scaleX(1.02);
-  transform-origin: left center;
-}}
-
-/* ── BTC Naira sub-value ── */
-.ngx-sub {{
-  font-family: 'DM Mono', monospace;
-  font-size: 10px;
-  font-weight: 600;
-  line-height: 1;
-  letter-spacing: -0.02em;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  margin-bottom: 3px;
-}}
-
-/* ── % Change row ── */
-.ngx-pct {{
-  font-family: 'DM Mono', monospace;
-  font-size: 12px;
-  font-weight: 600;
-  line-height: 1;
-  letter-spacing: 0em;
-  white-space: nowrap;
-  margin-top: 1px;
-}}
-
-/* ── Naira impact text (paid) ── */
-.ngx-impact {{
-  font-family: 'DM Mono', monospace;
-  font-size: 9px;
-  color: #4B5563;
-  line-height: 1.4;
-  margin-top: 7px;
-  padding-top: 6px;
-  border-top: 1px solid #0F1218;
-  display: -webkit-box;
-  -webkit-line-clamp: 2;
-  -webkit-box-orient: vertical;
-  overflow: hidden;
-}}
-.ngx-impact-locked {{
-  color: #2D3748;
-  font-size: 8.5px;
-}}
-
-/* ── Summary block ── */
-.gp-summary {{
-  background: #060910;
-  border: 1px solid #181B22;
-  border-left: 3px solid #F0A500;
-  border-radius: 8px;
-  padding: 10px 13px;
-  margin-top: 8px;
-}}
-.gp-summary-label {{
-  font-family: 'DM Mono', monospace;
-  font-size: 8.5px;
-  color: #F0A500;
-  text-transform: uppercase;
-  letter-spacing: 0.11em;
-  font-weight: 600;
-  display: block;
-  margin-bottom: 5px;
-}}
-.gp-summary-text {{
-  font-family: 'DM Mono', monospace;
-  font-size: 11.5px;
-  color: #C8C4BC;
-  line-height: 1.65;
-}}
-.gp-ai-badge {{
-  font-size: 8.5px;
-  color: #22C55E;
-  margin-left: 4px;
-}}
-.gp-upgrade {{
-  background: #0A0800;
-  border: 1px solid rgba(240,165,0,.1);
-  border-radius: 8px;
-  padding: 9px 13px;
-  margin-top: 8px;
-  font-family: 'DM Mono', monospace;
-  font-size: 11px;
-  color: #6B7280;
-  text-align: center;
-}}
-
-/* ════════════════════════════════════════════════
-   RESPONSIVE — mobile-first number scaling
-   ════════════════════════════════════════════════ */
-@media (max-width: 480px) {{
-  .ngx-price-xl {{
-    font-size: clamp(20px, 7vw, 28px);
-    letter-spacing: -0.03em;
+  /* ── Global Pulse wrapper ───────────────────────────────────────────── */
+  .gp-wrap {{ margin:16px 0 6px 0; }}
+  .gp-title-row {{
+    display:flex;align-items:baseline;justify-content:space-between;
+    flex-wrap:wrap;gap:6px;margin-bottom:3px;
   }}
-  .ngx-pct {{
-    font-size: 11px;
+  .gp-title {{
+    font-family:'Syne',sans-serif;
+    font-size:14px;font-weight:800;color:#FFFFFF;letter-spacing:-.01em;
   }}
-  .ngx-label {{
-    font-size: 8px;
+  .gp-subtitle {{
+    font-family:'DM Mono',monospace;
+    font-size:10px;color:#4B5563;
+    margin-bottom:10px;line-height:1.6;
   }}
-  .ngx-impact {{
-    font-size: 8.5px;
+  .gp-track-pills {{
+    display:flex;flex-wrap:wrap;gap:5px;margin-bottom:10px;
   }}
+  .gp-pill {{
+    font-family:'DM Mono',monospace;
+    font-size:9px;color:#6B7280;
+    background:#0D0F12;border:1px solid #1E2229;
+    border-radius:20px;padding:2px 8px;
+  }}
+
+  /* ── Premium tile grid ──────────────────────────────────────────────── */
   .gp-grid {{
-    gap: 6px;
+    display:grid;
+    grid-template-columns:repeat(2, 1fr);
+    gap:8px;
   }}
-}}
+  @media (min-width:640px) {{
+    .gp-grid {{ grid-template-columns:repeat(4, 1fr); }}
+  }}
 
-@media (min-width: 900px) {{
-  .ngx-price-xl {{
-    font-size: 34px;
-    letter-spacing: -0.05em;
+  /* ── Individual tile ────────────────────────────────────────────────── */
+  .ngx-card.gp-tile {{
+    background:#0A0C0F;
+    border:1px solid #1E2229;
+    border-radius:10px;
+    padding:10px 12px 10px 12px;
+    display:flex;
+    flex-direction:column;
+    justify-content:flex-start;
+    gap:0;
+    overflow:hidden;
+    min-width:0;
+    box-sizing:border-box;
   }}
-  .ngx-pct {{
-    font-size: 13px;
+
+  /* Top section — label, big number, change */
+  .gp-tile-top {{
+    display:flex;
+    flex-direction:column;
+    gap:0;
   }}
-  .gp-grid {{
-    grid-template-columns: repeat(4, 1fr);
+
+  /* ── Typography hierarchy ───────────────────────────────────────────── */
+  .gp-label {{
+    font-family:'DM Mono',monospace;
+    font-size:9.5px;
+    font-weight:500;
+    color:#4B5563;
+    text-transform:uppercase;
+    letter-spacing:.08em;
+    margin-bottom:4px;
+    white-space:nowrap;
+    overflow:hidden;
+    text-overflow:ellipsis;
+    opacity:0.8;
   }}
-}}
+
+  /* THE DOMINANT NUMBER */
+  .gp-price-xl {{
+    font-family:'DM Mono',monospace;
+    font-size:clamp(28px, 4.5vw, 44px);
+    font-weight:600;
+    color:#FFFFFF;
+    letter-spacing:-0.04em;
+    line-height:1;
+    margin-bottom:3px;
+    white-space:nowrap;
+    overflow:hidden;
+    text-overflow:ellipsis;
+    transform:scale(1.04);
+    transform-origin:left center;
+    /* scale adds visual weight without changing layout flow */
+  }}
+
+  /* Naira equivalent sub-line (BTC only) */
+  .gp-ngn-line {{
+    font-family:'DM Mono',monospace;
+    font-size:10px;
+    font-weight:500;
+    color:#22C55E;
+    letter-spacing:-0.02em;
+    line-height:1;
+    margin-bottom:3px;
+    white-space:nowrap;
+    overflow:hidden;
+    text-overflow:ellipsis;
+    opacity:0.85;
+  }}
+
+  /* Change % row */
+  .gp-pct {{
+    font-family:'DM Mono',monospace;
+    font-size:12px;
+    font-weight:600;
+    letter-spacing:-0.01em;
+    line-height:1;
+    margin-top:1px;
+  }}
+  .gp-pct-up {{ color:#22C55E; }}
+  .gp-pct-dn {{ color:#EF4444; }}
+  .gp-pct-nt {{ color:#6B7280; }}
+
+  /* Impact / lock sections */
+  .gp-impact-text {{
+    font-family:'DM Mono',monospace;
+    font-size:10px;
+    color:#9CA3AF;
+    line-height:1.55;
+    margin-top:8px;
+    padding-top:7px;
+    border-top:1px solid #1A1D24;
+  }}
+  .gp-impact-lock {{
+    font-family:'DM Mono',monospace;
+    font-size:10px;
+    color:#4B5563;
+    margin-top:8px;
+    padding-top:6px;
+    border-top:1px solid #1A1D24;
+  }}
+
+  /* ── Mobile tweaks (very small screens) ────────────────────────────── */
+  @media (max-width:380px) {{
+    .gp-price-xl {{
+      font-size:clamp(24px, 7.5vw, 34px);
+    }}
+    .ngx-card.gp-tile {{
+      padding:9px 10px;
+    }}
+  }}
 </style>
-
 <div class="gp-wrap">
-  <div class="gp-header">
+  <div class="gp-title-row">
     <span class="gp-title">🌍 Global Pulse</span>
-    <span class="gp-updated">Updated {updated_at}</span>
+    {ai_note}
   </div>
   <div class="gp-subtitle">
     How world markets are moving today — and what it means for your Naira and NGX portfolio.
   </div>
-  <div class="gp-pills">
+  <div class="gp-track-pills">
     <span class="gp-pill">🛢️ Brent Crude</span>
     <span class="gp-pill">💵 USD/NGN</span>
     <span class="gp-pill">₿ Bitcoin</span>
@@ -1045,7 +981,7 @@ def render_global_pulse_strip(tier: str, location: str = "home") -> None:
   </div>
   {summary_section}
 </div>
-<div style="height:8px;"></div>
+<div style="height:6px;"></div>
 """, unsafe_allow_html=True)
 
 
