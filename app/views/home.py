@@ -26,7 +26,7 @@ import hashlib
 from datetime import date, datetime, timedelta
 from app.utils.supabase_client import get_supabase
 from app.views.signals import generate_trending_sentiment_tag
-from app.views.global_pulse import render_global_pulse_strip, get_global_pulse, get_global_pulse_for_ai
+from app.views.global_pulse import render_global_pulse_strip, get_global_pulse, get_global_pulse_for_ai, get_sector_global_context
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1670,7 +1670,7 @@ def _render_faq():
 # PRO COMMAND CENTER CARD
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _render_pro_command_center(tier, insights, uniq, _sig_map, market, now, top_g, sb):
+def _render_pro_command_center(tier, insights, uniq, _sig_map, market, now, top_g, sb, _gp=None):
     """
     AI Trade Briefing Card — shown only to trader/pro users at the very top
     of the dashboard flow, above all other sections.
@@ -1781,48 +1781,62 @@ def _render_pro_command_center(tier, insights, uniq, _sig_map, market, now, top_
     }
     _action = _action_map.get(sig, _action_map["HOLD"])
 
-    # ── Global Pulse context (replaces old static market context) ────────────
-    # Fetches the live Global Pulse summary + per-stock sector impact for the
-    # spotlight stock displayed in the command center.
-    _gp_summary   = ""   # one-sentence macro summary
-    _gp_stock_ctx = ""   # sector-specific impact for the spotlight stock
+    # ── Global Pulse: Market Context + Spotlight Stock Impact ──────────────────
+    _context = ""
+    _spotlight_impact = ""
     try:
-        from app.views.global_pulse import get_global_pulse, get_sector_global_context
-        _pulse        = get_global_pulse()
-        _gp_impacts   = _pulse.get("impacts", {})
-        _gp_data      = _pulse.get("data", {})
-        _gp_summary   = _gp_impacts.get("summary", "")
+        _gp_data = _gp if _gp else get_global_pulse()
+        _gp_impacts = _gp_data.get("impacts", {})
+        _gp_raw     = _gp_data.get("data", {})
 
-        # Per-spotlight-stock sector impact
-        _spot_sector  = ""
+        # Market Context → use Global Pulse summary (always available via rules fallback)
+        _context = _gp_impacts.get("summary", "")
+
+        # Spotlight stock → derive sector and get Global Pulse sector impact
+        _oil_chg  = float(_gp_raw.get("oil",  {}).get("change_pct", 0) or 0)
+        _dxy_chg  = float(_gp_raw.get("dxy",  {}).get("change_pct", 0) or 0)
+        _btc_chg  = float(_gp_raw.get("btc",  {}).get("change_pct", 0) or 0)
+        _fg_score = float(_gp_raw.get("fg",   {}).get("score",     50) or 50)
+
+        # Look up sector for the spotlight stock from Supabase
+        _spot_sector = ""
         try:
-            _sec_r_data = _load_home_sectors()
-            if _sec_r_data:
-                # Try to find this stock's sector; fall back to top sector
-                _spot_row   = next(
-                    (r for r in _sec_r_data if sym in (r.get("symbol","") or "")),
-                    _sec_r_data[0]
-                )
-                _spot_sector = _spot_row.get("sector_name", "")
+            _sec_lookup = sb.table("signal_scores").select("sector") \
+                .eq("symbol", sym).order("score_date", desc=True).limit(1).execute()
+            if _sec_lookup.data:
+                _spot_sector = (_sec_lookup.data[0].get("sector") or "").strip()
         except Exception:
             pass
+        # Fallback: try stock_prices or a broad sector lookup
+        if not _spot_sector:
+            try:
+                _sp_lookup = sb.table("stock_prices").select("sector") \
+                    .eq("symbol", sym).limit(1).execute()
+                if _sp_lookup.data:
+                    _spot_sector = (_sp_lookup.data[0].get("sector") or "").strip()
+            except Exception:
+                pass
 
-        _gp_stock_ctx = get_sector_global_context(
-            sector   = _spot_sector or "Banking",
-            oil_chg  = _gp_data.get("oil", {}).get("change_pct", 0),
-            dxy_chg  = _gp_data.get("dxy", {}).get("change_pct", 0),
-            btc_chg  = _gp_data.get("btc", {}).get("change_pct", 0),
-            fg_score = _gp_data.get("fg",  {}).get("score", 50),
-        )
+        if _spot_sector and _oil_chg is not None:
+            _spotlight_impact = get_sector_global_context(
+                sector=_spot_sector,
+                oil_chg=_oil_chg,
+                dxy_chg=_dxy_chg,
+                btc_chg=_btc_chg,
+                fg_score=_fg_score,
+            )
+        elif not _spot_sector:
+            # Generic fallback using overall Global Pulse mood
+            _spotlight_impact = _gp_impacts.get("summary", "")
     except Exception:
-        # Graceful fallback — never crash the command center
-        _avg_chg  = sum(float(p.get("change_percent",0) or 0) for p in top_g[:5]) / max(len(top_g[:5]), 1)
-        _fb_mood  = "Bullish" if _avg_chg > 0.5 else "Bearish" if _avg_chg < -0.5 else "Neutral"
-        _gp_summary   = {"Bullish": "Overall market mood is positive — conditions are healthy for BUY signals.",
-                          "Bearish": "Overall market is under some pressure today. Extra caution is advised.",
-                          "Neutral": "The market is mixed today. Focus on stocks with the clearest signals."
-                          }.get(_fb_mood, "")
-        _gp_stock_ctx = ""
+        # If global pulse is completely unavailable, derive context the old way
+        _avg_chg = sum(float(p.get("change_percent",0) or 0) for p in top_g[:5]) / max(len(top_g[:5]), 1)
+        _mctx_mood = "Bullish" if _avg_chg > 0.5 else "Bearish" if _avg_chg < -0.5 else "Neutral"
+        _mood_ctx = {"Bullish": "Overall market mood is positive — conditions are healthy for BUY signals.",
+                     "Bearish": "Overall market is under some pressure today. Extra caution is advised.",
+                     "Neutral": "The market is mixed today. Focus on stocks with the clearest signals."}
+        _context = _mood_ctx.get(_mctx_mood, _mood_ctx["Neutral"])
+        _spotlight_impact = _context
 
     # Last refreshed display
     _refreshed_str = now.strftime("%I:%M %p") + " WAT"
@@ -1976,18 +1990,16 @@ html,body{{background:transparent;font-family:'DM Mono',monospace;overflow-x:hid
       <span class="callout-icon">&#128161;</span>
       <span class="callout-text" style="color:#86EFAC;">{_action}</span>
     </div>
-    <div class="sec-lbl"><div class="sec-line"></div>🌍 Global Pulse — Today&#39;s Summary<div class="sec-line"></div></div>
-    <div class="ctx-box" style="background:rgba(34,197,94,.05);border:1px solid rgba(34,197,94,.18);">
+    <div class="sec-lbl"><div class="sec-line"></div>Global Pulse — Market Context Today<div class="sec-line"></div></div>
+    <div class="ctx-box">
       <span class="callout-icon">&#127757;</span>
-      <span class="ctx-text">{_gp_summary if _gp_summary else "Global market data is loading — check back in a moment."}</span>
+      <span class="ctx-text">{_context}</span>
     </div>
-    {(f"""
-    <div class="sec-lbl"><div class="sec-line"></div>Global Impact on {sym}<div class="sec-line"></div></div>
-    <div class="ctx-box" style="background:rgba(96,165,250,.05);border:1px solid rgba(96,165,250,.18);">
-      <span class="callout-icon">&#128202;</span>
-      <span class="ctx-text">{_gp_stock_ctx}</span>
+    <div class="sec-lbl"><div class="sec-line"></div>Global Pulse Impact on {sym}<div class="sec-line"></div></div>
+    <div class="callout" style="background:#0A0D15;border:1px solid #3B82F630;">
+      <span class="callout-icon">&#127758;</span>
+      <span class="callout-text" style="color:#93C5FD;">{_spotlight_impact}</span>
     </div>
-    """ if _gp_stock_ctx else "")}
     <div class="footer">
       <span class="footer-text">Not financial advice &nbsp;&middot;&nbsp; Always DYOR</span>
       <span class="footer-text">Signal: {now.strftime("%d %b %Y")}</span>
@@ -2122,9 +2134,13 @@ function buildExportCard() {{
         <span>💡</span><span>{_action}</span>
       </div>
 
-      <div style="font-size:9px;color:#9CA3AF;text-transform:uppercase;letter-spacing:.15em;text-align:center;margin-bottom:10px;">Market Context</div>
+      <div style="font-size:9px;color:#9CA3AF;text-transform:uppercase;letter-spacing:.15em;text-align:center;margin-bottom:10px;">Global Pulse — Market Context Today</div>
+      <div style="background:#EFF6FF;border:1px solid #BFDBFE;border-radius:10px;padding:12px 14px;margin-bottom:14px;display:flex;gap:10px;font-size:12px;color:#1E40AF;line-height:1.65;">
+        <span>🌍</span><span>{_context}</span>
+      </div>
+      <div style="font-size:9px;color:#9CA3AF;text-transform:uppercase;letter-spacing:.15em;text-align:center;margin-bottom:10px;">Global Pulse Impact on {sym}</div>
       <div style="background:#EFF6FF;border:1px solid #BFDBFE;border-radius:10px;padding:12px 14px;margin-bottom:20px;display:flex;gap:10px;font-size:12px;color:#1E40AF;line-height:1.65;">
-        <span>🌐</span><span>{_context}</span>
+        <span>🌐</span><span>{_spotlight_impact}</span>
       </div>
     </div>
 
@@ -2201,8 +2217,8 @@ function shareAsPDF() {{
 </body>
 </html>"""
 
-    # Auto-calculate height: card has many sections — use 1100 min, scrolling enabled
-    st.components.v1.html(_card_html, height=1120, scrolling=True)
+    # Auto-calculate height: card has many sections — use 1220 min, scrolling enabled
+    st.components.v1.html(_card_html, height=1220, scrolling=True)
 
     # CTA button — Full Analysis only
     _,_bc_full,_ = st.columns([1, 2, 1])
@@ -2791,7 +2807,7 @@ def render():
 
         # ── PRO COMMAND CENTER — Trader & Pro only, above the fold ───────────
         if is_trader or is_pro:
-            _render_pro_command_center(tier, insights, uniq, _sig_map, market, now, top_g, sb)
+            _render_pro_command_center(tier, insights, uniq, _sig_map, market, now, top_g, sb, _gp)
 
         # ── Trial activity card ───────────────────────────────────────────────
         if is_trial:
