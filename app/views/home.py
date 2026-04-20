@@ -1781,23 +1781,48 @@ def _render_pro_command_center(tier, insights, uniq, _sig_map, market, now, top_
     }
     _action = _action_map.get(sig, _action_map["HOLD"])
 
-    # Market context from sector + mood
-    _top_sector = ""
+    # ── Global Pulse context (replaces old static market context) ────────────
+    # Fetches the live Global Pulse summary + per-stock sector impact for the
+    # spotlight stock displayed in the command center.
+    _gp_summary   = ""   # one-sentence macro summary
+    _gp_stock_ctx = ""   # sector-specific impact for the spotlight stock
     try:
-        _sec_r_data = _load_home_sectors()
-        if _sec_r_data:
-            _ts = _sec_r_data[0]
-            _top_sector = f"{_ts['sector_name']} stocks are attracting strong attention today. "
+        from app.views.global_pulse import get_global_pulse, get_sector_global_context
+        _pulse        = get_global_pulse()
+        _gp_impacts   = _pulse.get("impacts", {})
+        _gp_data      = _pulse.get("data", {})
+        _gp_summary   = _gp_impacts.get("summary", "")
+
+        # Per-spotlight-stock sector impact
+        _spot_sector  = ""
+        try:
+            _sec_r_data = _load_home_sectors()
+            if _sec_r_data:
+                # Try to find this stock's sector; fall back to top sector
+                _spot_row   = next(
+                    (r for r in _sec_r_data if sym in (r.get("symbol","") or "")),
+                    _sec_r_data[0]
+                )
+                _spot_sector = _spot_row.get("sector_name", "")
+        except Exception:
+            pass
+
+        _gp_stock_ctx = get_sector_global_context(
+            sector   = _spot_sector or "Banking",
+            oil_chg  = _gp_data.get("oil", {}).get("change_pct", 0),
+            dxy_chg  = _gp_data.get("dxy", {}).get("change_pct", 0),
+            btc_chg  = _gp_data.get("btc", {}).get("change_pct", 0),
+            fg_score = _gp_data.get("fg",  {}).get("score", 50),
+        )
     except Exception:
-        pass
-    _mood_ctx = {"Bullish": "Overall market mood is positive — conditions are healthy for BUY signals.",
-                 "Bearish": "Overall market is under some pressure today. Extra caution is advised.",
-                 "Neutral": "The market is mixed today. Focus on stocks with the clearest signals."
-                 }
-    # Derive mood from top_g data
-    _avg_chg = sum(float(p.get("change_percent",0) or 0) for p in top_g[:5]) / max(len(top_g[:5]), 1)
-    _mctx_mood = "Bullish" if _avg_chg > 0.5 else "Bearish" if _avg_chg < -0.5 else "Neutral"
-    _context = _top_sector + _mood_ctx.get(_mctx_mood, _mood_ctx["Neutral"])
+        # Graceful fallback — never crash the command center
+        _avg_chg  = sum(float(p.get("change_percent",0) or 0) for p in top_g[:5]) / max(len(top_g[:5]), 1)
+        _fb_mood  = "Bullish" if _avg_chg > 0.5 else "Bearish" if _avg_chg < -0.5 else "Neutral"
+        _gp_summary   = {"Bullish": "Overall market mood is positive — conditions are healthy for BUY signals.",
+                          "Bearish": "Overall market is under some pressure today. Extra caution is advised.",
+                          "Neutral": "The market is mixed today. Focus on stocks with the clearest signals."
+                          }.get(_fb_mood, "")
+        _gp_stock_ctx = ""
 
     # Last refreshed display
     _refreshed_str = now.strftime("%I:%M %p") + " WAT"
@@ -1951,11 +1976,18 @@ html,body{{background:transparent;font-family:'DM Mono',monospace;overflow-x:hid
       <span class="callout-icon">&#128161;</span>
       <span class="callout-text" style="color:#86EFAC;">{_action}</span>
     </div>
-    <div class="sec-lbl"><div class="sec-line"></div>Market Context<div class="sec-line"></div></div>
-    <div class="ctx-box">
+    <div class="sec-lbl"><div class="sec-line"></div>🌍 Global Pulse — Today&#39;s Summary<div class="sec-line"></div></div>
+    <div class="ctx-box" style="background:rgba(34,197,94,.05);border:1px solid rgba(34,197,94,.18);">
       <span class="callout-icon">&#127757;</span>
-      <span class="ctx-text">{_context}</span>
+      <span class="ctx-text">{_gp_summary if _gp_summary else "Global market data is loading — check back in a moment."}</span>
     </div>
+    {(f"""
+    <div class="sec-lbl"><div class="sec-line"></div>Global Impact on {sym}<div class="sec-line"></div></div>
+    <div class="ctx-box" style="background:rgba(96,165,250,.05);border:1px solid rgba(96,165,250,.18);">
+      <span class="callout-icon">&#128202;</span>
+      <span class="ctx-text">{_gp_stock_ctx}</span>
+    </div>
+    """ if _gp_stock_ctx else "")}
     <div class="footer">
       <span class="footer-text">Not financial advice &nbsp;&middot;&nbsp; Always DYOR</span>
       <span class="footer-text">Signal: {now.strftime("%d %b %Y")}</span>
